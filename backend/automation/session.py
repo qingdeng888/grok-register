@@ -30,6 +30,7 @@ from playwright._impl._transport import PipeTransport as _PwPipeTransport
 from playwright.sync_api._generated import Playwright as _SyncPlaywright
 
 from backend.automation.page_adapter import CamoufoxBrowser, CamoufoxPage
+from backend.automation.socks_http_bridge import Socks5Bridge
 
 
 class IsolatedCamoufox(_Camoufox):
@@ -400,6 +401,40 @@ def _build_camoufox_proxy(proxy_str: str) -> dict:
     return result
 
 
+def _is_socks5_proxy(proxy_str: str) -> bool:
+    """判断是否为 socks5 代理（含 socks5h / socks）。"""
+    scheme = urlparse(proxy_str).scheme.lower()
+    return scheme in {"socks5", "socks5h", "socks"}
+
+
+def _build_browser_proxy(proxy_str: str) -> dict:
+    """构建传给 Camoufox 的 proxy dict。
+
+    - http:// 代理：直接透传
+    - socks5:// 代理：Firefox 不支持 socks5 认证，启动本地无认证 HTTP 代理桥
+      （Socks5Bridge）转发到 socks5 上游，让浏览器走本地 HTTP 代理。
+    """
+    proxy_str = (proxy_str or "").strip()
+    if not proxy_str:
+        return {}
+    if _is_socks5_proxy(proxy_str):
+        bridge = Socks5Bridge(proxy_str)
+        host, port = bridge.start()
+        _tls.socks_bridge = bridge
+        return {"server": f"http://{host}:{port}"}
+    return _build_camoufox_proxy(proxy_str)
+
+
+def _stop_socks_bridge() -> None:
+    bridge = getattr(_tls, "socks_bridge", None)
+    if bridge is not None:
+        try:
+            bridge.stop()
+        except Exception:
+            pass
+        _tls.socks_bridge = None
+
+
 def _detect_camoufox_exe() -> str:
     """检测 Camoufox 可执行文件路径，支持新旧两种安装格式。
 
@@ -516,11 +551,11 @@ def create_browser_options(unique_profile=True) -> dict:
     if exe_path:
         opts["executable_path"] = exe_path
 
-    # 代理
+    # 代理：socks5 走本地 HTTP 桥，http 直接透传
     proxies = _proxies()
     proxy = str(proxies.get("https") or proxies.get("http") or "").strip()
     if proxy:
-        opts["proxy"] = _build_camoufox_proxy(proxy)
+        opts["proxy"] = _build_browser_proxy(proxy)
 
     # 扩展（Camoufox 使用 addons 参数，加载已解压的 Firefox 扩展目录）
     # 默认会附带 uBlock；若缓存损坏则自动 exclude，避免 manifest.json missing。
@@ -621,6 +656,7 @@ def start_browser(log_callback=None) -> Tuple[object, object]:
                 pass
             set_browser_session(None, None)
             _cleanup_profile_dir(profile_dir)
+            _stop_socks_bridge()
             time.sleep(min(1.5 * attempt, 4))
     raise Exception(f"浏览器启动失败，已重试4次: {last_exc}")
 
@@ -633,12 +669,14 @@ def stop_browser(force=False):
     set_browser_session(None, None)
     if current is None:
         _cleanup_profile_dir(profile_dir)
+        _stop_socks_bridge()
         return
     try:
         current.quit(del_data=True)
     except BaseException:
         pass
     _cleanup_profile_dir(profile_dir)
+    _stop_socks_bridge()
 
 
 def restart_browser(log_callback=None):

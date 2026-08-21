@@ -20,7 +20,7 @@
 
 - Web 控制台：任务进度、实时日志、账号管理和系统设置
 - Camoufox 浏览器，支持多 worker 和异常进程清理
-- 支持 Cloudflare、DuckMail / Mail.tm、YYDS、MailNest、OutlookEmail、CloudMail
+- 支持 Cloudflare、DuckMail / Mail.tm、YYDS、MailNest、OutlookEmail、CloudMail、Inbucket（自建）
 - 注册完成后生成 CPA / Grok2API JSON
 - JSON 查看、复制和下载
 - 首次访问创建唯一管理员账号
@@ -40,6 +40,8 @@ docker compose up -d
 ```
 
 访问：`http://服务器IP:8787`
+
+> 外部端口由 `compose.yaml` 的端口映射控制（如 `10006:8787`），容器内部固定 `8787`；改外部端口直接编辑该映射后 `docker compose up -d` 重建即可。
 
 查看状态和日志：
 
@@ -160,9 +162,12 @@ Windows 启动：
 | 配置项 | 说明 |
 | --- | --- |
 | `email_provider` | 邮箱服务商 |
+| `inbucket_base_url` | Inbucket 站点根地址（自建邮箱） |
+| `inbucket_api_key` | Inbucket API Key（可选，配了 API 密钥才填） |
+| `inbucket_domain` | Inbucket 收信域名，支持 `*` 通配符随机子域，如 `*.mail.example.com` |
 | `register_count` | 注册数量 |
 | `register_workers` | 并发数量，默认 1 |
-| `proxy` | 注册和 OAuth 请求使用的代理 |
+| `proxy` | 注册和 OAuth 请求使用的代理。支持 `http://` 与带认证的 `socks5://user:pass@ip:port`；socks5 由本地 HTTP 代理桥转发，仅注册走代理，邮箱验证码始终直连 |
 | `browser_headless` | 本机无头模式；Docker 中强制关闭 |
 | `cpa_auto_add` | 注册后生成 CPA 授权 |
 | `cpa_auth_dir` | CPA JSON 保存目录 |

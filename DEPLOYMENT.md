@@ -65,7 +65,6 @@ logs/    运行日志
 
 ```dotenv
 GROK_REGISTER_IMAGE=grok-register:local
-GROK_WEB_PORT=8787
 GROK_SHM_SIZE=1gb
 GROK_WEB_COOKIE_SECURE=0
 ```
@@ -243,13 +242,7 @@ docker compose logs --tail=200 grok-register
 
 ### 端口被占用
 
-在 `.env` 修改：
-
-```dotenv
-GROK_WEB_PORT=18787
-```
-
-然后：
+外部端口由 `compose.yaml` 的端口映射控制（容器内部固定 `8787`）。修改 `compose.yaml` 的映射，例如将 `"8787:8787"` 换成 `"18787:8787"`，然后重建：
 
 ```bash
 docker compose up -d --force-recreate

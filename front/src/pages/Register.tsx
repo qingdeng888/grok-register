@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   ArrowDownToLine,
@@ -41,6 +41,11 @@ import { cn } from "@/lib/utils";
 
 type BusyAction = "" | "start" | "stop" | "check" | "kill";
 type LogTone = "default" | "success" | "error" | "warn" | "info";
+type DisplayLogItem = LogItem & { tone: LogTone; searchText: string };
+
+const MAX_LOG_BUFFER = 2000;
+const DEFAULT_RENDERED_LOGS = 300;
+const LOG_RENDER_STEP = 300;
 
 function normalizeInteger(value: string | number, min: number, max: number, fallback = min) {
   const parsed = Number.parseInt(String(value), 10);
@@ -85,17 +90,71 @@ const logToneClass: Record<LogTone, string> = {
   info: "text-slate-800",
 };
 
+function sameJobStatus(current: JobStatus | null, next: JobStatus) {
+  if (!current) return false;
+  return (
+    current.running === next.running &&
+    current.started_at === next.started_at &&
+    current.finished_at === next.finished_at &&
+    current.target_count === next.target_count &&
+    current.workers === next.workers &&
+    current.source === next.source &&
+    current.last_error === next.last_error &&
+    current.log_count === next.log_count &&
+    current.latest_log_id === next.latest_log_id &&
+    current.completed_count === next.completed_count &&
+    current.success_count === next.success_count &&
+    current.failure_count === next.failure_count &&
+    current.progress_percent === next.progress_percent &&
+    current.current_stage === next.current_stage &&
+    current.current_email === next.current_email &&
+    current.batch_id === next.batch_id
+  );
+}
+
+const ElapsedTime = memo(function ElapsedTime({
+  startedAt,
+  finishedAt,
+  running,
+}: {
+  startedAt?: number | null;
+  finishedAt?: number | null;
+  running: boolean;
+}) {
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (!running) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [running, startedAt]);
+
+  if (!startedAt) return <>—</>;
+  const endMs = running ? now : finishedAt ? finishedAt * 1000 : now;
+  return <>{formatDuration(Math.max(0, (endMs - startedAt * 1000) / 1000))}</>;
+});
+
+const LogLine = memo(function LogLine({ item }: { item: DisplayLogItem }) {
+  return (
+    <div className="border-b border-slate-200/60 py-0.5 last:border-0 [contain-intrinsic-size:auto_24px] [content-visibility:auto]">
+      <span className="text-sky-600">[{item.time}]</span>{" "}
+      <span className={cn("whitespace-pre-wrap break-all", logToneClass[item.tone])}>{item.message}</span>
+    </div>
+  );
+});
+
 export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
   const [count, setCount] = useState("1");
   const [workers, setWorkers] = useState("1");
   const [job, setJob] = useState<JobStatus | null>(null);
-  const [logs, setLogs] = useState<LogItem[]>([]);
+  const [logs, setLogs] = useState<DisplayLogItem[]>([]);
+  const [renderedLogLimit, setRenderedLogLimit] = useState(DEFAULT_RENDERED_LOGS);
   const [logViewCleared, setLogViewCleared] = useState(false);
   const [autoScroll, setAutoScroll] = useState(true);
   const [showJumpBottom, setShowJumpBottom] = useState(false);
   const [logQuery, setLogQuery] = useState("");
   const [logLevel, setLogLevel] = useState<"all" | LogTone>("all");
-  const [nowTs, setNowTs] = useState(() => Date.now());
   const [busyAction, setBusyAction] = useState<BusyAction>("");
   const [jobPolling, setJobPolling] = useState(true);
   const [checks, setChecks] = useState<Array<{ name: string; ok: boolean; detail: string }>>([]);
@@ -127,21 +186,24 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
   const successRate =
     progressCompleted > 0 ? Math.round((successCount / Math.max(progressCompleted, 1)) * 100) : null;
 
-  const elapsedSeconds = useMemo(() => {
-    if (!job?.started_at) return 0;
-    const endMs = job.running ? nowTs : job.finished_at ? job.finished_at * 1000 : nowTs;
-    return Math.max(0, (endMs - job.started_at * 1000) / 1000);
-  }, [job?.started_at, job?.finished_at, job?.running, nowTs]);
+  const deferredLogQuery = useDeferredValue(logQuery);
 
   const filteredLogs = useMemo(() => {
-    const q = logQuery.trim().toLowerCase();
+    const q = deferredLogQuery.trim().toLowerCase();
+    if (!q && logLevel === "all") return logs;
     return logs.filter((item) => {
-      const tone = detectLogTone(item.message);
-      if (logLevel !== "all" && tone !== logLevel) return false;
+      if (logLevel !== "all" && item.tone !== logLevel) return false;
       if (!q) return true;
-      return item.message.toLowerCase().includes(q) || String(item.time || "").includes(q);
+      return item.searchText.includes(q);
     });
-  }, [logs, logQuery, logLevel]);
+  }, [logs, deferredLogQuery, logLevel]);
+
+  const renderedLogs = useMemo(
+    () => filteredLogs.slice(-renderedLogLimit),
+    [filteredLogs, renderedLogLimit]
+  );
+  const hiddenFilteredLogCount = Math.max(filteredLogs.length - renderedLogs.length, 0);
+  const latestRenderedLogId = renderedLogs[renderedLogs.length - 1]?.id || 0;
 
   const showToast = (message: string, tone: "default" | "success" | "error" = "default") => {
     setToast({ message, tone });
@@ -158,11 +220,16 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
     const viewVersion = logViewVersionRef.current;
     try {
       const data = await api.logs(afterIdRef.current, 500);
-      setJob(data.job);
+      setJob((current) => (sameJobStatus(current, data.job) ? current : data.job));
       if (viewVersion !== logViewVersionRef.current) return data.job;
       const freshLogs = (data.logs || []).filter((item) => item.id > afterIdRef.current);
       if (freshLogs.length) {
-        setLogs((prev) => [...prev, ...freshLogs].slice(-2000));
+        const preparedLogs = freshLogs.map((item) => ({
+          ...item,
+          tone: detectLogTone(item.message),
+          searchText: `${item.time || ""}\n${item.message}`.toLowerCase(),
+        }));
+        setLogs((prev) => [...prev, ...preparedLogs].slice(-MAX_LOG_BUFFER));
         afterIdRef.current = freshLogs[freshLogs.length - 1].id;
         setLogViewCleared(false);
       }
@@ -209,13 +276,7 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
   }, [jobPolling]);
 
   useEffect(() => {
-    if (!job?.running) return;
-    const timer = window.setInterval(() => setNowTs(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, [job?.running]);
-
-  useEffect(() => {
-    if (view !== "runtime") return;
+    if (view !== "runtime" || !resultsExpanded) return;
     let cancelled = false;
     let timer: number | undefined;
 
@@ -244,14 +305,24 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
       cancelled = true;
       if (timer) window.clearInterval(timer);
     };
-  }, [view, job?.batch_id, job?.running, job?.completed_count, job?.success_count, job?.failure_count]);
+  }, [view, resultsExpanded, job?.batch_id, job?.running]);
+
+  useEffect(() => {
+    setRunResults([]);
+    setRunResultsTotal(0);
+    setResultDetail(null);
+  }, [job?.batch_id]);
+
+  useEffect(() => {
+    setRenderedLogLimit(DEFAULT_RENDERED_LOGS);
+  }, [deferredLogQuery, logLevel]);
 
   useEffect(() => {
     if (autoScroll && !userPinnedRef.current && logRef.current) {
       logRef.current.scrollTop = logRef.current.scrollHeight;
       setShowJumpBottom(false);
     }
-  }, [filteredLogs, autoScroll]);
+  }, [latestRenderedLogId, autoScroll]);
 
   useEffect(() => {
     if (!opsOpen && !checksOpen && !resultDetail) return;
@@ -280,6 +351,19 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
     el.scrollTop = el.scrollHeight;
     userPinnedRef.current = false;
     setShowJumpBottom(false);
+  };
+
+  const revealOlderLogs = () => {
+    const el = logRef.current;
+    const previousHeight = el?.scrollHeight || 0;
+    const previousTop = el?.scrollTop || 0;
+    setRenderedLogLimit((current) =>
+      Math.min(filteredLogs.length, current + LOG_RENDER_STEP)
+    );
+    window.requestAnimationFrame(() => {
+      if (!el) return;
+      el.scrollTop = previousTop + Math.max(el.scrollHeight - previousHeight, 0);
+    });
   };
 
   const onStart = async () => {
@@ -352,6 +436,7 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
     const latestId = Math.max(afterIdRef.current, Number(job?.latest_log_id || 0));
     logViewVersionRef.current += 1;
     setLogs([]);
+    setRenderedLogLimit(DEFAULT_RENDERED_LOGS);
     afterIdRef.current = latestId;
     setLogViewCleared(true);
     showToast(job?.running ? "视图已清空，将继续接收新日志" : "日志视图已清空");
@@ -624,7 +709,11 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
                 已用时
               </div>
               <div className="mt-1 text-base font-semibold tabular-nums text-slate-950">
-                {job?.started_at ? formatDuration(elapsedSeconds) : "—"}
+                <ElapsedTime
+                  startedAt={job?.started_at}
+                  finishedAt={job?.finished_at}
+                  running={!!job?.running}
+                />
               </div>
             </div>
             <div className="rounded-xl border border-slate-200 bg-slate-50/70 px-3 py-3">
@@ -657,6 +746,7 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
               <span className="tabular-nums">
                 视图缓冲 {logs.length} 行
                 {filteredLogs.length !== logs.length ? ` · 筛选后 ${filteredLogs.length}` : ""}
+                {renderedLogs.length !== filteredLogs.length ? ` · 当前渲染 ${renderedLogs.length}` : ""}
                 {" · "}
                 源 {job?.source || "—"}
               </span>
@@ -674,9 +764,14 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
         const failureItems = runResults.filter(
           (item) => item.status === "failure" || (!item.success && item.status !== "success")
         );
-        const successCount = successItems.length;
-        const failureCount = failureItems.length;
-        const totalCount = runResultsTotal || runResults.length;
+        const resultSuccessCount = Number(job?.success_count ?? successItems.length);
+        const resultFailureCount = Number(job?.failure_count ?? failureItems.length);
+        const totalCount = Math.max(
+          Number(job?.completed_count || 0),
+          runResultsTotal,
+          runResults.length,
+          resultSuccessCount + resultFailureCount
+        );
         const visible =
           resultTab === "success" ? successItems : resultTab === "failure" ? failureItems : runResults;
         const accountsQuery = (status?: string) => {
@@ -700,8 +795,8 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
               <span className="min-w-0 flex-1">
                 <span className="flex flex-wrap items-center gap-2">
                   <span className="text-base font-semibold text-slate-950">本次结果</span>
-                  <Badge variant="success">成功 {successCount}</Badge>
-                  <Badge variant="destructive">失败 {failureCount}</Badge>
+                  <Badge variant="success">成功 {resultSuccessCount}</Badge>
+                  <Badge variant="destructive">失败 {resultFailureCount}</Badge>
                   <span className="text-xs tabular-nums text-slate-500">共 {totalCount} 条</span>
                 </span>
                 <span className="mt-1 block truncate text-xs text-slate-500">
@@ -727,9 +822,9 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
                   <div className="flex flex-wrap gap-1.5">
                     {(
                       [
-                        ["all", `全部 ${runResults.length}`],
-                        ["success", `成功 ${successCount}`],
-                        ["failure", `失败 ${failureCount}`],
+                        ["all", `全部 ${totalCount}`],
+                        ["success", `成功 ${resultSuccessCount}`],
+                        ["failure", `失败 ${resultFailureCount}`],
                       ] as const
                     ).map(([id, label]) => (
                       <button
@@ -907,15 +1002,20 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
               {job?.running ? "日志持续同步中" : "等待新任务"}
             </span>
             <span className="tabular-nums">
-              目标 {job?.target_count ?? 0} · 并发 {job?.workers ?? 1} · 完成 {progressCompleted}
+              完成 {progressCompleted} · 显示 {renderedLogs.length} / {filteredLogs.length} · 缓冲 {logs.length}
             </span>
+          </div>
+
+          <div className="sr-only" aria-live="polite" aria-atomic="true">
+            {renderedLogs.length ? `最新日志：${renderedLogs[renderedLogs.length - 1].message}` : ""}
           </div>
 
           <div
             ref={logRef}
             onScroll={onLogScroll}
             role="log"
-            aria-live="polite"
+            aria-label="实时注册日志"
+            aria-live="off"
             className="font-mono-log h-[50dvh] min-h-[360px] max-h-[640px] overflow-auto rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs leading-6 sm:h-[540px] sm:p-4"
           >
             {filteredLogs.length === 0 ? (
@@ -936,15 +1036,23 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
                 ) : null}
               </div>
             ) : (
-              filteredLogs.map((item) => {
-                const tone = detectLogTone(item.message);
-                return (
-                  <div key={item.id} className="border-b border-slate-200/60 py-0.5 last:border-0">
-                    <span className="text-sky-600">[{item.time}]</span>{" "}
-                    <span className={cn("whitespace-pre-wrap break-all", logToneClass[tone])}>{item.message}</span>
+              <>
+                {hiddenFilteredLogCount > 0 ? (
+                  <div className="mb-2 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 font-sans text-xs text-slate-500">
+                    <span>为保持流畅，前面 {hiddenFilteredLogCount} 行暂未生成页面节点。</span>
+                    <button
+                      type="button"
+                      onClick={revealOlderLogs}
+                      className="font-medium text-sky-600 hover:text-sky-700"
+                    >
+                      再显示 {Math.min(LOG_RENDER_STEP, hiddenFilteredLogCount)} 行
+                    </button>
                   </div>
-                );
-              })
+                ) : null}
+                {renderedLogs.map((item) => (
+                  <LogLine key={item.id} item={item} />
+                ))}
+              </>
             )}
           </div>
 
@@ -1028,7 +1136,11 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
                 <div className="flex justify-between gap-2">
                   <span>已用时</span>
                   <span className="tabular-nums font-medium text-slate-900">
-                    {job?.started_at ? formatDuration(elapsedSeconds) : "—"}
+                    <ElapsedTime
+                      startedAt={job?.started_at}
+                      finishedAt={job?.finished_at}
+                      running={!!job?.running}
+                    />
                   </span>
                 </div>
                 <div className="flex justify-between gap-2">

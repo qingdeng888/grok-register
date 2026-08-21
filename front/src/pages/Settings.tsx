@@ -39,6 +39,11 @@ const PROVIDERS = [
     description: "通用临时邮箱接口；DuckMail 可填 API Key，Mail.tm 公共接口可留空。",
   },
   {
+    value: "inbucket",
+    label: "Inbucket 自建邮箱",
+    description: "自托管 Inbucket 邮箱服务，需站点地址和收信域名；API Key 可选。",
+  },
+  {
     value: "yyds",
     label: "YYDS 临时邮箱",
     description: "需要 YYDS API Key 或 JWT，可固定已验证收信域名。",
@@ -371,7 +376,7 @@ export function SettingsPage({ section = "registration" }: { section?: SettingsS
                 <ArrowRight className="h-4 w-4" aria-hidden="true" />
               </Link>
             </div>
-            <ConfigField {...fieldState} label="网络代理" field="proxy" placeholder="http://127.0.0.1:7890" />
+            <ConfigField {...fieldState} label="网络代理" field="proxy" placeholder="socks5://user:pass@ip:端口" helper="支持 http/https/socks5，可带账号密码；仅浏览器注册走代理，获取邮箱验证码走直连" />
             <ConfigField {...fieldState}
               label="账号间隔（秒）"
               field="account_interval"
@@ -523,6 +528,14 @@ export function SettingsPage({ section = "registration" }: { section?: SettingsS
               <>
                 <ConfigField {...fieldState} label="接口地址" field="duckmail_api_base" helper="DuckMail 默认 https://api.duckmail.sbs；Mail.tm 填 https://api.mail.tm" />
                 <ConfigField {...fieldState} label="API Key" field="duckmail_api_key" type="password" helper="DuckMail 私有域需要；Mail.tm 公共接口可留空" />
+              </>
+            ) : null}
+
+            {selectedProvider.value === "inbucket" ? (
+              <>
+                <ConfigField {...fieldState} label="接口地址" field="inbucket_base_url" placeholder="http://127.0.0.1:2500" helper="Inbucket web 根地址，不要带 /api 或结尾斜杠" />
+                <ConfigField {...fieldState} label="API Key" field="inbucket_api_key" type="password" helper="可选；Inbucket 配置了 API 密钥时才需要" />
+                <ConfigField {...fieldState} label="收信域名" field="inbucket_domain" placeholder="*.mail.example.com" helper="必填，需与 Inbucket 收信域名一致；支持 * 通配符随机子域，如 *.mail.example.com" />
               </>
             ) : null}
 

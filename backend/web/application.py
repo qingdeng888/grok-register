@@ -42,6 +42,9 @@ CONFIG_PUBLIC_KEYS = (
     "email_provider",
     "duckmail_api_key",
     "duckmail_api_base",
+    "inbucket_base_url",
+    "inbucket_api_key",
+    "inbucket_domain",
     "defaultDomains",
     "cloudmail_url",
     "cloudmail_admin_email",
@@ -95,6 +98,7 @@ CONFIG_PUBLIC_KEYS = (
 
 SENSITIVE_HINT_KEYS = {
     "duckmail_api_key",
+    "inbucket_api_key",
     "cloudmail_password",
     "cloudflare_api_key",
     "cloudflare_custom_auth",
@@ -333,7 +337,7 @@ def _apply_config_updates(updates: Dict[str, Any]) -> Dict[str, Any]:
                 value = "en-US"
         elif key == "email_provider":
             value = str(value or "cloudflare").strip().lower() or "cloudflare"
-            if value not in {"cloudflare", "duckmail", "yyds", "mailnest", "outlookemail", "cloudmail"}:
+            if value not in {"cloudflare", "duckmail", "inbucket", "yyds", "mailnest", "outlookemail", "cloudmail"}:
                 value = "cloudflare"
         elif key == "outlookemail_source":
             value = str(value or "accounts").strip().lower()

@@ -59,3 +59,25 @@ class BrowserHeadlessConfigTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BrowserSocks5ProxyTests(unittest.TestCase):
+    def test_socks5_with_auth_builds_playwright_proxy(self):
+        proxy = browser_session._build_camoufox_proxy("socks5://user:pass@1.2.3.4:7890")
+        self.assertEqual(proxy["server"], "socks5://1.2.3.4:7890")
+        self.assertEqual(proxy["username"], "user")
+        self.assertEqual(proxy["password"], "pass")
+
+    def test_socks5_without_auth_builds_playwright_proxy(self):
+        proxy = browser_session._build_camoufox_proxy("socks5://5.6.7.8:1080")
+        self.assertEqual(proxy["server"], "socks5://5.6.7.8:1080")
+        self.assertNotIn("username", proxy)
+
+    def test_http_proxy_with_auth_builds_playwright_proxy(self):
+        proxy = browser_session._build_camoufox_proxy("http://u:p@9.9.9.9:8080")
+        self.assertEqual(proxy["server"], "http://9.9.9.9:8080")
+        self.assertEqual(proxy["username"], "u")
+        self.assertEqual(proxy["password"], "p")
+
+    def test_empty_proxy_returns_empty_dict(self):
+        self.assertEqual(browser_session._build_camoufox_proxy(""), {})

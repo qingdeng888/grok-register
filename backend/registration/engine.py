@@ -30,6 +30,7 @@ from backend.integrations import grok2api_client as _grok2api
 from backend.mailbox import cloudflare_worker as cloudflare_provider
 from backend.mailbox import cloud_mail as cloudmail_provider
 from backend.mailbox import duck_mail as duckmail_provider
+from backend.mailbox import inbucket_mail as inbucket_provider
 from backend.mailbox import mail_nest as mailnest_provider
 from backend.mailbox import outlook_pool as outlookemail_provider
 from backend.mailbox import yyds_mail as yyds_provider
@@ -265,6 +266,9 @@ DEFAULT_CONFIG = {
     "email_provider": "cloudflare",
     "duckmail_api_key": "",
     "duckmail_api_base": "https://api.duckmail.sbs",
+    "inbucket_base_url": "",
+    "inbucket_api_key": "",
+    "inbucket_domain": "",
     "defaultDomains": "",
     "cloudmail_url": "",
     "cloudmail_admin_email": "",
@@ -754,6 +758,18 @@ def _log_actual_http_route(method, url, *, proxies=None, proxy=""):
 
 def get_duckmail_api_base():
     return duckmail_provider.normalize_base(str(config.get("duckmail_api_base", "") or ""))
+
+
+def get_inbucket_base_url():
+    return inbucket_provider.normalize_base(str(config.get("inbucket_base_url", "") or ""))
+
+
+def get_inbucket_api_key():
+    return str(config.get("inbucket_api_key", "") or "").strip()
+
+
+def get_inbucket_domain():
+    return inbucket_provider.normalize_domain(str(config.get("inbucket_domain", "") or ""))
 
 
 def get_duckmail_api_key():
@@ -1860,6 +1876,11 @@ def get_email_and_token(api_key=None):
                 ) from fallback_exc
     if provider == "mailnest":
         return mailnest_buy_email(), "_"
+    if provider == "inbucket":
+        return inbucket_provider.create_mailbox(
+            domain=get_inbucket_domain(),
+            base_url=get_inbucket_base_url(),
+        )
     return duckmail_provider.create_mailbox(
         http_get,
         http_post,
@@ -1926,6 +1947,20 @@ def get_oai_code(
             poll_interval=poll_interval,
             log_callback=log_callback,
             cancel_callback=cancel_callback,
+        )
+    if provider == "inbucket":
+        return inbucket_provider.wait_for_code(
+            http_get,
+            get_inbucket_base_url(),
+            dev_token,
+            email,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            raise_if_cancelled=raise_if_cancelled,
+            sleep_with_cancel=sleep_with_cancel,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            api_key=get_inbucket_api_key(),
         )
     return duckmail_get_oai_code(
         dev_token,

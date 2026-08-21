@@ -133,10 +133,18 @@ def parse_raw_email(raw: str) -> dict:
 
 
 def _match_code(pattern: re.Pattern, source: str) -> Optional[str]:
-    """取第一个含字母的匹配，纯数字串（如 100-200）不是验证码。"""
+    """取第一个匹配的验证码 token。
+
+    带上下文的匹配（``confirmation code: XXX-XXX`` 等）可信，纯数字也收
+    （xAI 现在下发 186-711 这类数字验证码）；裸 token 只收含字母的，避免
+    正文里偶然出现的数值区间（如 100-200）被误当验证码。
+    """
+    has_context = pattern is _CODE_WITH_CONTEXT_RE
     for match in pattern.finditer(source):
         token = match.group(1)
-        if any(ch.isalpha() for ch in token):
+        if not any(ch.isdigit() for ch in token):
+            return token
+        if has_context or any(ch.isalpha() for ch in token):
             return token
     return None
 
