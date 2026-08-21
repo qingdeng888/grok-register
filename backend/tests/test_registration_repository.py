@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -57,9 +58,17 @@ class RegistrationRepositoryMigrationTests(unittest.TestCase):
             with closing(sqlite3.connect(path)) as conn:
                 columns = {row[1] for row in conn.execute("PRAGMA table_info(registration_results)")}
                 version = conn.execute("PRAGMA user_version").fetchone()[0]
-            self.assertEqual(version, 6)
+            self.assertEqual(version, 7)
             self.assertIn("bot_risk", columns)
             self.assertIn("bfs", columns)
+            with closing(sqlite3.connect(path)) as outbox_conn:
+                outbox_tables = {
+                    row[0]
+                    for row in outbox_conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    )
+                }
+            self.assertIn("grokiq_outbox", outbox_tables)
             self.assertTrue(
                 {
                     "email_account_id",
@@ -172,14 +181,304 @@ class RegistrationRepositoryMigrationTests(unittest.TestCase):
                     "email": "safe@example.com",
                     "status": "success",
                     "bot_risk": False,
+                    "bfs": 0,
+                }
+            )
+            store.add_result(
+                {
+                    "email": "unknown@example.com",
+                    "status": "success",
+                    "bot_risk": False,
+                }
+            )
+            store.add_result(
+                {
+                    "email": "source-only-risk@example.com",
+                    "status": "success",
+                    "bot_risk": False,
+                    "bfs": 4,
+                }
+            )
+            store.add_result(
+                {
+                    "email": "legacy-clean@example.com",
+                    "status": "success",
+                    "bot_risk": False,
+                    "extra_json": json.dumps({"sso_check_status": "clean"}),
                 }
             )
             risk_rows = store.list_results(bot_risk="1")
-            self.assertEqual([row["email"] for row in risk_rows], ["risk@example.com"])
-            self.assertEqual(store.count_results(bot_risk="risk"), 1)
+            self.assertEqual(
+                [row["email"] for row in risk_rows],
+                ["source-only-risk@example.com", "risk@example.com"],
+            )
+            self.assertEqual(store.count_results(bot_risk="risk"), 2)
             safe_rows = store.list_results(bot_risk="0")
-            self.assertEqual([row["email"] for row in safe_rows], ["safe@example.com"])
-            self.assertEqual(store.count_results(bot_risk="normal"), 1)
+            self.assertEqual(
+                [row["email"] for row in safe_rows],
+                ["legacy-clean@example.com", "safe@example.com"],
+            )
+            self.assertEqual(store.count_results(bot_risk="normal"), 2)
+            unknown_rows = store.list_results(bot_risk="unknown")
+            self.assertEqual([row["email"] for row in unknown_rows], ["unknown@example.com"])
+
+    def test_list_result_ids_matches_filters_and_list_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RegistrationRepository(Path(tmp) / "results.sqlite3")
+            first = store.add_result(
+                {"email": "first@example.com", "status": "success", "provider": "fixture"}
+            )
+            second = store.add_result(
+                {"email": "second@example.com", "status": "failure", "provider": "fixture"}
+            )
+            third = store.add_result(
+                {"email": "third@example.com", "status": "success", "provider": "other"}
+            )
+
+            expected = [row["id"] for row in store.list_results(status="success", keyword="fixture")]
+            self.assertEqual(store.list_result_ids(status="success", keyword="fixture"), expected)
+            self.assertEqual(expected, [first])
+            self.assertNotIn(second, expected)
+            self.assertNotIn(third, expected)
+
+    def test_actionable_ids_apply_task_and_risk_filters(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RegistrationRepository(Path(tmp) / "results.sqlite3")
+            safe = store.add_result(
+                {
+                    "email": "safe@example.com",
+                    "password": "secret",
+                    "status": "success",
+                    "sso_saved": True,
+                    "bot_risk": False,
+                    "bfs": 0,
+                    "auth_info": "batch-action-needle",
+                }
+            )
+            risky = store.add_result(
+                {
+                    "email": "risk@example.com",
+                    "password": "secret",
+                    "status": "success",
+                    "sso_saved": True,
+                    "bot_risk": True,
+                    "bfs": 2,
+                }
+            )
+            unknown = store.add_result(
+                {
+                    "email": "unknown@example.com",
+                    "password": "secret",
+                    "status": "success",
+                    "sso_saved": True,
+                    "bot_risk": False,
+                }
+            )
+            store.add_result(
+                {
+                    "email": "missing-password@example.com",
+                    "password": "",
+                    "status": "success",
+                    "sso_saved": True,
+                    "bot_risk": False,
+                }
+            )
+
+            self.assertEqual(store.list_actionable_result_ids("relogin", bot_risk="0"), [safe])
+            self.assertEqual(store.list_actionable_result_ids("sso_check", bot_risk="1"), [risky])
+            self.assertEqual(store.list_actionable_result_ids("relogin", bot_risk="unknown"), [unknown])
+            self.assertEqual(store.list_actionable_result_ids("sso_check", keyword="safe@"), [safe])
+            self.assertEqual(
+                store.list_actionable_result_ids("sso_check", keyword="batch-action-needle"),
+                [safe],
+            )
+
+    def test_registration_risk_email_is_treated_as_consumed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RegistrationRepository(Path(tmp) / "results.sqlite3")
+            store.add_result(
+                {
+                    "email": "risk@outlook.com",
+                    "status": "failure",
+                    "failure_type": "registration_risk",
+                    "failure_reason": "注册风控拒绝",
+                }
+            )
+            store.add_result(
+                {
+                    "email": "sso@outlook.com",
+                    "status": "failure",
+                    "failure_type": "sso_timeout",
+                    "failure_reason": "未获取到 sso cookie",
+                }
+            )
+            store.add_result(
+                {
+                    "email": "timeout@outlook.com",
+                    "status": "failure",
+                    "failure_type": "code_timeout",
+                    "failure_reason": "未收到验证码",
+                }
+            )
+
+            self.assertTrue(store.has_registered_or_consumed("risk@outlook.com"))
+            self.assertTrue(store.has_registered_or_consumed("sso@outlook.com"))
+            self.assertFalse(store.has_registered_or_consumed("timeout@outlook.com"))
+
+    def test_successful_relogin_marks_registration_success_and_clears_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RegistrationRepository(Path(tmp) / "results.sqlite3")
+            account_id = store.add_result(
+                {
+                    "email": "failed@example.com",
+                    "password": "secret",
+                    "status": "failure",
+                    "success": False,
+                    "failure_type": "login_error",
+                    "failure_reason": "Turnstile 未通过",
+                    "screenshot_path": "/tmp/old-failure.png",
+                    "extra_json": json.dumps(
+                        {
+                            "exception_type": "RuntimeError: fixture",
+                            "exception_traceback": "Traceback fixture",
+                            "relogin_diagnostics": {"stage": "填写邮箱和密码"},
+                        }
+                    ),
+                }
+            )
+
+            self.assertTrue(
+                store.update_relogin_result(
+                    account_id,
+                    account_file="/tmp/failed@example.com.txt",
+                    cpa_detail={
+                        "enabled": True,
+                        "status": "success",
+                        "auth_info": "CPA 本地: /tmp/cpa.json",
+                        "auth_path": "/tmp/cpa.json",
+                        "cpa_auth_path": "/tmp/cpa.json",
+                        "grok2api_auth_path": "/tmp/g2a.json",
+                        "grok2api_remote_status": "success",
+                        "grok2api_remote_imported_at": "2026-08-14 00:00:00",
+                    },
+                    status="success",
+                    error="",
+                )
+            )
+
+            refreshed = store.get_results_by_ids([account_id])[0]
+            extra = json.loads(refreshed["extra_json"])
+            self.assertEqual(refreshed["status"], "success")
+            self.assertEqual(refreshed["success"], 1)
+            self.assertEqual(refreshed["failure_type"], "")
+            self.assertEqual(refreshed["failure_reason"], "")
+            self.assertEqual(refreshed["screenshot_path"], "")
+            self.assertEqual(refreshed["grok2api_auth_path"], "/tmp/g2a.json")
+            self.assertEqual(refreshed["grok2api_remote_status"], "success")
+            self.assertEqual(extra["relogin_status"], "success")
+            self.assertNotIn("exception_traceback", extra)
+            self.assertNotIn("exception_type", extra)
+            self.assertNotIn("relogin_diagnostics", extra)
+
+    def test_failed_relogin_does_not_rewrite_registration_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RegistrationRepository(Path(tmp) / "results.sqlite3")
+            account_id = store.add_result(
+                {
+                    "email": "still-failed@example.com",
+                    "status": "failure",
+                    "success": False,
+                    "failure_type": "login_error",
+                    "failure_reason": "原始注册失败",
+                }
+            )
+
+            self.assertTrue(
+                store.update_relogin_result(
+                    account_id,
+                    status="failed",
+                    error="登录超时",
+                )
+            )
+
+            refreshed = store.get_results_by_ids([account_id])[0]
+            extra = json.loads(refreshed["extra_json"])
+            self.assertEqual(refreshed["status"], "failure")
+            self.assertEqual(refreshed["success"], 0)
+            self.assertEqual(refreshed["failure_type"], "login_error")
+            self.assertEqual(refreshed["failure_reason"], "原始注册失败")
+            self.assertEqual(extra["relogin_status"], "failed")
+            self.assertEqual(extra["relogin_error"], "登录超时")
+
+    def test_flagged_partial_relogin_replaces_sso_timeout_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RegistrationRepository(Path(tmp) / "results.sqlite3")
+            account_id = store.add_result(
+                {
+                    "email": "risk-after-relogin@example.com",
+                    "password": "secret",
+                    "status": "failure",
+                    "success": False,
+                    "failure_type": "sso_timeout",
+                    "failure_reason": "等待 SSO 超时",
+                }
+            )
+
+            self.assertTrue(
+                store.update_relogin_result(
+                    account_id,
+                    account_file="/tmp/risk-after-relogin@example.com.txt",
+                    cpa_detail={
+                        "enabled": True,
+                        "status": "not_attempted",
+                        "bot_risk": True,
+                        "bfs": "3",
+                    },
+                    status="partial",
+                    error="SSO 风控异常，已停止授权重建: botFlagSource=3",
+                    failure_type="registration_risk",
+                    failure_reason="SSO 风控异常，已停止授权重建: botFlagSource=3",
+                )
+            )
+
+            refreshed = store.get_results_by_ids([account_id])[0]
+            self.assertEqual(refreshed["status"], "failure")
+            self.assertEqual(refreshed["success"], 0)
+            self.assertEqual(refreshed["failure_type"], "registration_risk")
+            self.assertIn("botFlagSource=3", refreshed["failure_reason"])
+            self.assertEqual(refreshed["sso_saved"], 1)
+            self.assertEqual(refreshed["bot_risk"], 1)
+            self.assertEqual(refreshed["bfs"], "3")
+
+    def test_backfill_repairs_existing_relogin_risk_loop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RegistrationRepository(Path(tmp) / "results.sqlite3")
+            account_id = store.add_result(
+                {
+                    "email": "existing-loop@example.com",
+                    "status": "failure",
+                    "success": False,
+                    "failure_type": "sso_timeout",
+                    "failure_reason": "等待 SSO 超时",
+                    "bot_risk": True,
+                    "bfs": "7",
+                    "extra_json": json.dumps(
+                        {
+                            "relogin_status": "partial",
+                            "sso_check_status": "flagged",
+                        }
+                    ),
+                }
+            )
+
+            self.assertEqual(store.backfill_registration_risk_bot_risk(), 1)
+            refreshed = store.get_results_by_ids([account_id])[0]
+            self.assertEqual(refreshed["failure_type"], "registration_risk")
+            self.assertEqual(
+                refreshed["failure_reason"],
+                "重新登录 SSO 风控异常: botFlagSource=7",
+            )
+            self.assertEqual(store.backfill_registration_risk_bot_risk(), 0)
 
 
 if __name__ == "__main__":

@@ -180,9 +180,14 @@ def access_token_bfs(token: str):
 
 
 def access_token_bot_risk(token: str) -> bool:
-    """access_token 的 bfs=1 表示风控标记。"""
+    """access_token 的 bfs=0 表示正常，任何非零值表示风控标记。"""
     bfs = access_token_bfs(token)
-    return bfs == 1 or bfs == "1"
+    if bfs is None or isinstance(bfs, bool):
+        return False
+    try:
+        return int(bfs) != 0
+    except (TypeError, ValueError):
+        return False
 
 
 def rfc3339_ns(ts: float | None = None) -> str:

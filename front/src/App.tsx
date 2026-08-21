@@ -11,6 +11,7 @@ import { ReloginPage } from "@/pages/Relogin";
 import { ReloginHistoryPage } from "@/pages/ReloginHistory";
 import { CredentialsPage } from "@/pages/Credentials";
 import { ConfigFilePage } from "@/pages/ConfigFile";
+import { SsoCheckHistoryPage, SsoCheckPage } from "@/pages/SsoCheck";
 
 export default function App() {
   const [jobRunning, setJobRunning] = useState(false);
@@ -30,7 +31,14 @@ export default function App() {
     };
     window.addEventListener("grok-auth-required", onAuthRequired);
     window.addEventListener("grok-job-state", onJobState);
-    api.authMe().then((data) => setAuth(data)).catch(() => setAuth({ enabled: true, setup_required: false, authenticated: false })).finally(() => setAuthLoading(false));
+    api.authMe()
+      .then((data) => setAuth({
+        enabled: !!data.enabled,
+        setup_required: !!data.setup_required,
+        authenticated: !!data.authenticated,
+      }))
+      .catch(() => setAuth({ enabled: true, setup_required: false, authenticated: false }))
+      .finally(() => setAuthLoading(false));
     return () => {
       window.removeEventListener("grok-auth-required", onAuthRequired);
       window.removeEventListener("grok-job-state", onJobState);
@@ -83,6 +91,9 @@ export default function App() {
         <Route index element={<Navigate to="/overview" replace />} />
         <Route path="overview" element={<DashboardPage />} />
         <Route path="accounts" element={<AccountsPage />} />
+        <Route path="accounts/sso-check" element={<SsoCheckPage />} />
+        <Route path="accounts/sso-check/history" element={<SsoCheckHistoryPage />} />
+        <Route path="accounts/sso-check/history/:runId" element={<SsoCheckHistoryPage />} />
         <Route path="accounts/relogin" element={<ReloginPage />} />
         <Route path="accounts/relogin/history" element={<ReloginHistoryPage />} />
         <Route path="accounts/relogin/history/:runId" element={<ReloginHistoryPage />} />
@@ -91,8 +102,11 @@ export default function App() {
         <Route path="registration/runtime" element={<RegisterPage view="runtime" />} />
         <Route path="register" element={<Navigate to="/registration/new" replace />} />
         <Route path="settings/registration" element={<SettingsPage section="registration" />} />
-        <Route path="settings/cpa" element={<SettingsPage section="cpa" />} />
-        <Route path="settings/grok2api" element={<SettingsPage section="grok2api" />} />
+        {/* TokenAuth：统一管理 SSO 授权转换与下游上传目标 */}
+        <Route path="settings/tokenauth" element={<SettingsPage section="tokenauth" />} />
+        {/* 旧路由保留重定向，避免书签/外链 404 */}
+        <Route path="settings/cpa" element={<Navigate to="/settings/tokenauth" replace />} />
+        <Route path="settings/grok2api" element={<Navigate to="/settings/tokenauth" replace />} />
         <Route path="settings/mail" element={<SettingsPage section="mail" />} />
         <Route path="settings/outlook" element={<SettingsPage section="outlook" />} />
         <Route path="settings/config" element={<ConfigFilePage />} />

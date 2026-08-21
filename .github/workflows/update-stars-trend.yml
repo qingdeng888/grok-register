@@ -1,0 +1,45 @@
+name: Update Stars trend
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-stars-trend
+  cancel-in-progress: true
+
+jobs:
+  update:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Refresh Stars data and charts
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/update_stars_trend.py
+
+      - name: Commit updated chart
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add \
+            .github/data/stars-history.json \
+            docs/images/stars-trend-light.svg \
+            docs/images/stars-trend-dark.svg
+
+          if git diff --cached --quiet; then
+            echo "Stars trend is already current."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "docs: update stars trend [skip ci]"
+          git push

@@ -11,7 +11,7 @@ from typing import Callable, List, Tuple
 from urllib.parse import urlparse
 
 from backend.mailbox import cloudflare_worker as cloudflare_provider
-from backend.integrations.proxy import resolve_proxy_url
+from backend.integrations.proxy import redact_proxy_text, resolve_proxy_url
 from backend.shared.paths import resolve_project_path
 
 CheckResult = Tuple[str, bool, str]  # name, ok, detail
@@ -79,12 +79,12 @@ def check_proxy(proxy_url: str, http_get: Callable) -> CheckResult:
             )
         except Exception as exc:
             # TCP 通但出站失败也提示
-            return "代理", False, f"TCP 通，出站探测失败: {exc}"
+            return "代理", False, f"TCP 通，出站探测失败: {redact_proxy_text(exc)}"
         if exit_ip:
             return "代理", True, f"{host}:{port} 可用，出口IP {exit_ip}"
         return "代理", True, f"{host}:{port} 可用（未解析到出口IP）"
     except Exception as exc:
-        return "代理", False, str(exc)
+        return "代理", False, redact_proxy_text(exc)
 
 
 def check_xai_signup(proxy_url: str, http_get: Callable) -> CheckResult:
@@ -138,7 +138,7 @@ def check_xai_signup(proxy_url: str, http_get: Callable) -> CheckResult:
             return XAI_SIGNUP_CHECK_NAME, False, f"HTTP {status or 'unknown'}"
         return XAI_SIGNUP_CHECK_NAME, True, f"可达 HTTP {status}"
     except Exception as exc:
-        return XAI_SIGNUP_CHECK_NAME, False, str(exc)
+        return XAI_SIGNUP_CHECK_NAME, False, redact_proxy_text(exc)
 
 
 def has_blocking_xai_failure(results: List[CheckResult]) -> bool:

@@ -1,6 +1,6 @@
 # 部署说明
 
-Docker Compose 是推荐方式。容器内使用 Xvfb 运行有头 Camoufox，因此无桌面、只有 SSH 的 Linux 服务器也能运行。
+Docker Compose 是推荐方式。容器内使用 Xvfb 运行有头 Camoufox 或 CloakBrowser，因此无桌面、只有 SSH 的 Linux 服务器也能运行；默认后端保持 Camoufox。
 
 ## Docker Compose：本地构建
 
@@ -26,6 +26,12 @@ docker compose logs -f grok-register
 
 ```bash
 docker compose run --rm grok-register python /app/docker/camoufox_smoke.py
+```
+
+验证 CloakBrowser（首次运行会把 Chromium 下载到 `data/cloakbrowser-cache/`）：
+
+```bash
+docker compose run --rm grok-register python /app/docker/cloakbrowser_smoke.py
 ```
 
 停止或更新：
@@ -151,7 +157,7 @@ GROK_REGISTER_IMAGE=ghcr.io/kaibush/grok-register:latest
 
 ```bash
 docker compose pull
-docker compose up -d
+docker compose up -d --force-recreate
 ```
 
 私有镜像先登录：
@@ -163,11 +169,50 @@ echo "$GITHUB_TOKEN" | docker login ghcr.io -u GITHUB_USER --password-stdin
 GitHub Actions 规则：
 
 - `master` / `main`：构建并发布 amd64
-- `v*` 标签：构建并发布 amd64、arm64
+- `v*` 标签：构建并发布 amd64、arm64，同时创建 GitHub Release
 - Pull Request：只测试和构建，不发布
 - `workflow_dispatch`：支持手动触发
 
+注册机启动时会立即读取 GitHub 最新 Release，之后每 1 小时复查。管理页面
+发现新版本后自动弹出可关闭提示；同一版本关闭一次后不再重复提示。登录后访问
+`/overview?preview-update=1` 可以预览弹窗，不需要先创建测试 Release。实际升级
+继续通过 `docker compose pull && docker compose up -d --force-recreate` 完成。
+
 需要免登录分发时，在 GitHub Packages 将容器包设为 Public。
+
+## 与 GrokIQ 统一编排
+
+`compose.grokiq.yaml` 会在同一 Compose 网络中并列启动注册机、GrokIQ 后端和 GrokIQ 前端：
+
+```bash
+cp .env.example .env
+# 编辑 .env，至少让 GROKIQ_WEBHOOK_TOKEN 与 GrokIQ 令牌一致
+docker compose -f compose.yaml -f compose.grokiq.yaml pull
+docker compose -f compose.yaml -f compose.grokiq.yaml up -d
+```
+
+容器内调用地址固定为：
+
+```text
+http://grokiq-backend:8090/api/integrations/grok-register/account-imported
+```
+
+GrokIQ 后端只有 `expose: 8090`，没有映射宿主机端口；注册机通过 Compose 内部网络投递 Webhook。GrokIQ 前端默认绑定宿主机所有网卡：
+
+```text
+0.0.0.0:${GROKIQ_WEB_PORT:-8091}
+```
+
+因此可直接通过 `http://服务器公网IP:8091` 访问。若只允许反向代理访问，在 `.env` 设置 `GROKIQ_WEB_BIND=127.0.0.1`，再将现有域名整体转发到 `127.0.0.1:8091`。GrokIQ 前端 Nginx 会把 `/api` 转发到内部后端。
+
+首次启动后还需在两个页面完成配置：
+
+1. GrokIQ“系统设置 → 联动与启动项”设置联动 Token、开启注册后探针并保存探针方案、轮数和出口目标。
+2. 注册机“系统设置 → Grok2API”开启 GrokIQ 联动，填写相同 Token；探针设置只在 GrokIQ 维护。
+
+新账号默认稳定等待由 `GROKIQ_REGISTER_PROBE_STABILIZATION_SECONDS=15` 控制，也可在 GrokIQ 页面修改；设为 `0` 时收到事件后立即创建首次探针。
+
+注册机只在 `grok_build` 导入成功后发送一次账号已导入事件。HTTP 未接收时由本地持久 Outbox 重试；收到 `2xx` 后结束投递，不查询后续探针或风险结果。
 
 ## 本机 Python 运行
 
@@ -237,6 +282,7 @@ Linux 宿主机使用 `127.0.0.1` 监听代理时，需在代理软件中开启 
 
 ```bash
 docker compose run --rm grok-register python /app/docker/camoufox_smoke.py
+docker compose run --rm grok-register python /app/docker/cloakbrowser_smoke.py
 docker compose logs --tail=200 grok-register
 ```
 

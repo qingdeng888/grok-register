@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Link, useSearchParams } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import {
   Braces,
   Bug,
@@ -11,7 +11,6 @@ import {
   Database,
   Download,
   Eye,
-  History,
   Loader2,
   LogIn,
   UploadCloud,
@@ -24,7 +23,8 @@ import {
   X,
 } from "lucide-react";
 import { AccountBatchActions } from "@/components/AccountBatchActions";
-import { AccountEmailIcon } from "@/components/AccountEmailIcon";
+import { AccountEmailIcon, EmailProviderLabel, emailProviderLabel } from "@/components/AccountEmailIcon";
+import { AccountFilterBar, AccountSelectionToolbar } from "@/components/AccountTableToolbar";
 import { api, type AccountRecord, type ReloginStatus } from "@/lib/api";
 import { appendReloginHistory } from "@/lib/reloginHistory";
 import { cn, copyText, formatDuration, maskSecret } from "@/lib/utils";
@@ -102,6 +102,16 @@ function importStatusLabel(status: string) {
   return labels[status] || status || "未知";
 }
 
+function grokiqDeliveryLabel(status: string) {
+  const labels: Record<string, string> = {
+    pending: "等待投递",
+    delivering: "正在投递",
+    delivered: "已接收",
+    not_queued: "未加入队列",
+  };
+  return labels[status] || status || "未加入队列";
+}
+
 function compactBadgeVariant(status: string) {
   if (status === "success") return "success" as const;
   if (status === "failed" || status === "rejected") return "destructive" as const;
@@ -170,6 +180,135 @@ function emailDisableLabel(status: string) {
   return labels[status] || status || "-";
 }
 
+type ReloginRecoveryKind = "sso_timeout" | "sso_token_exchange";
+
+function reloginRecoveryKind(
+  item: Pick<AccountRecord, "status" | "cpa_status" | "failure_type" | "failure_reason" | "bot_risk">,
+): ReloginRecoveryKind | null {
+  // 重登成功后的旧记录可能还保留历史 failure_type；CPA 已成功时不再重复提醒。
+  // 风控结论已经明确时，重复重登只会形成 sso_timeout -> 风控 -> 再重登的循环。
+  if (item.bot_risk || item.status !== "failure" || item.cpa_status === "success") return null;
+  if (item.failure_type === "sso_timeout") return "sso_timeout";
+  if (
+    item.failure_type === "cpa"
+    && /sso\s*换\s*token\s*失败/i.test(item.failure_reason || "")
+  ) {
+    return "sso_token_exchange";
+  }
+  return null;
+}
+
+function ReloginRecoveryHint({
+  item,
+  compact = false,
+  running = false,
+  taskRunning = false,
+  stage = "",
+  onRelogin,
+}: {
+  item: AccountRecord;
+  compact?: boolean;
+  running?: boolean;
+  taskRunning?: boolean;
+  stage?: string;
+  onRelogin: (item: AccountRecord, confirm?: boolean) => void;
+}) {
+  const kind = reloginRecoveryKind(item);
+  if (!kind) return null;
+
+  const title = kind === "sso_timeout"
+    ? "未获取到 SSO，授权文件尚未生成"
+    : "SSO 换 Token 失败，授权文件尚未生成";
+  const compactTitle = kind === "sso_timeout" ? "SSO 获取超时" : "SSO 换 Token 失败";
+  const credentialsMissing = !item.email || !item.password;
+  const disabled = taskRunning || credentialsMissing;
+  const buttonLabel = running ? (stage || "正在重登") : "立即重登";
+  const buttonTitle = credentialsMissing
+    ? "该记录缺少邮箱或密码"
+    : taskRunning && !running
+      ? "已有重新登录任务正在运行"
+      : undefined;
+
+  if (compact) {
+    return (
+      <div
+        role="status"
+        className="flex min-w-0 items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-2 py-1.5 text-amber-950 shadow-sm shadow-amber-100/40"
+      >
+        <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-white text-amber-600 ring-1 ring-amber-200">
+          {running ? (
+            <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+          ) : (
+            <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
+          )}
+        </span>
+        <div className="min-w-0 flex-1 truncate text-[11px] font-semibold leading-4" title={title}>
+          {running ? (stage || "正在重新登录") : `${compactTitle} · 可重登修复`}
+        </div>
+        <Button
+          type="button"
+          size="sm"
+          variant="ghost"
+          className="h-7 min-h-7 shrink-0 rounded-md px-2 text-[11px] font-semibold text-amber-900 hover:bg-amber-100 hover:text-amber-950"
+          disabled={disabled}
+          title={buttonTitle}
+          onClick={() => onRelogin(item, false)}
+        >
+          {running ? "处理中" : "重登"}
+        </Button>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      role="status"
+      className="rounded-lg border border-amber-200 bg-amber-50/80 p-3.5 text-amber-950 shadow-sm"
+    >
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex min-w-0 items-start gap-3">
+          <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-white text-amber-600 shadow-sm ring-1 ring-amber-200">
+            {running ? (
+              <Loader2 className="h-5 w-5 animate-spin" aria-hidden="true" />
+            ) : (
+              <RefreshCw className="h-5 w-5" aria-hidden="true" />
+            )}
+          </span>
+          <div className="min-w-0">
+            <div className="mb-1 flex flex-wrap items-center gap-2">
+              <Badge variant="warning" className="rounded-md px-1.5 py-0 text-[10px] shadow-none">
+                可重登修复
+              </Badge>
+              <span className="text-[11px] font-medium text-amber-700">
+                {kind === "sso_timeout" ? "SSO 获取异常" : "授权转换异常"}
+              </span>
+            </div>
+            <div className="text-sm font-semibold leading-5">{running ? (stage || "正在重新登录") : title}</div>
+            <p className="mt-1 text-xs leading-5 text-amber-800">
+              点击立即重登刷新 SSO；系统会先检查账号风控，再重建 CPA / Grok2API 授权文件。
+            </p>
+          </div>
+        </div>
+        <Button
+          type="button"
+          variant="outline"
+          className="min-h-9 shrink-0 border-amber-300 bg-white text-amber-950 shadow-sm hover:border-amber-400 hover:bg-amber-100 hover:text-amber-950"
+          disabled={disabled}
+          title={buttonTitle}
+          onClick={() => onRelogin(item, false)}
+        >
+          {running ? (
+            <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+          ) : (
+            <LogIn className="h-4 w-4" aria-hidden="true" />
+          )}
+          {buttonLabel}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 function AuthExportLink({
   item,
   kind,
@@ -216,6 +355,8 @@ function AccountDetails({
   authJsonLoading,
   onRelogin,
   reloginRunning,
+  reloginTaskRunning,
+  reloginStage,
 }: {
   detail: AccountRecord;
   showPassword: boolean;
@@ -224,16 +365,28 @@ function AccountDetails({
   onCopyAuthJson: (kind: "cpa" | "grok2api") => void;
   onDownloadAuthJson: (kind: "cpa" | "grok2api") => void;
   authJsonLoading: "" | "copy-cpa" | "copy-grok2api";
-  onRelogin: (item: AccountRecord) => void;
+  onRelogin: (item: AccountRecord, confirm?: boolean) => void;
   reloginRunning: boolean;
+  reloginTaskRunning: boolean;
+  reloginStage: string;
 }) {
+  const riskCheck = detail.sso_risk_check;
+  const riskSource = riskCheck?.bot_flag_source;
+  const riskSourceLabel = riskSource === null || riskSource === undefined || riskSource === ""
+    ? "未知"
+    : String(riskSource);
+  const emailMatchLabel = riskCheck?.email_match === true
+    ? "一致"
+    : riskCheck?.email_match === false
+      ? "不一致"
+      : "未检查";
   const fields: Array<[string, string]> = [
     ["邮箱", detail.email],
     ["密码", showPassword ? detail.password : maskSecret(detail.password)],
     ["状态", detail.status],
     ["风控标记", detail.bot_risk ? "是（该账号被打上机器人标记）" : "否"],
     ["CPA", detail.cpa_status],
-    ["服务商", detail.provider],
+    ["邮箱来源", emailProviderLabel(detail.provider)],
     ["NSFW", detail.nsfw_status],
     ["账号文件", detail.account_file],
     ["Auth 路径", detail.auth_path],
@@ -245,6 +398,10 @@ function AccountDetails({
     ["Grok2API 远程入库", remoteImportLabel(detail.grok2api_remote_status)],
     ["Grok2API 远程入库时间", detail.grok2api_remote_imported_at],
     ["Grok2API 远程错误", detail.grok2api_remote_error],
+    ["Webhook 投递", grokiqDeliveryLabel(detail.grokiq_delivery?.status || "not_queued")],
+    ["Webhook 尝试次数", String(detail.grokiq_delivery?.attempts || 0)],
+    ["Webhook 接收时间", detail.grokiq_delivery?.delivered_at || ""],
+    ["Webhook 最近错误", detail.grokiq_delivery?.last_error || ""],
     ["Auth 信息", detail.auth_info],
     ["邮箱池账号 ID", detail.email_account_id],
     ["邮箱停用状态", emailDisableLabel(detail.email_disable_status)],
@@ -277,11 +434,61 @@ function AccountDetails({
           <Badge variant={cpaVariant(detail.grok2api_remote_status)}>
             Grok2API {remoteImportLabel(detail.grok2api_remote_status)}
           </Badge>
+          {detail.grokiq_delivery?.status && detail.grokiq_delivery.status !== "not_queued" ? (
+            <Badge variant={cpaVariant(detail.grokiq_delivery.status === "delivered" ? "success" : "ready")}>
+              Webhook {grokiqDeliveryLabel(detail.grokiq_delivery.status)}
+            </Badge>
+          ) : null}
           <Badge variant={emailDisableVariant(detail.email_disable_status)}>
             邮箱 {emailDisableLabel(detail.email_disable_status)}
           </Badge>
         </div>
       </div>
+
+      <ReloginRecoveryHint
+        item={detail}
+        running={reloginRunning}
+        taskRunning={reloginTaskRunning}
+        stage={reloginStage}
+        onRelogin={onRelogin}
+      />
+
+      {riskCheck ? (
+        <section className="overflow-hidden rounded-xl border border-slate-200 bg-slate-50/80">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 px-3 py-2.5">
+            <div className="flex items-center gap-2 text-sm font-semibold text-slate-800">
+              <ShieldAlert className="h-4 w-4 text-sky-600" aria-hidden="true" />
+              SSO 详细风控
+            </div>
+            <Badge variant={riskCheck.flagged ? "destructive" : riskSourceLabel === "0" ? "success" : "warning"}>
+              {riskCheck.verdict || (riskCheck.flagged ? "flagged" : riskSourceLabel === "0" ? "clean" : "unknown")}
+            </Badge>
+          </div>
+          <dl className="grid grid-cols-2 gap-px bg-slate-200 sm:grid-cols-4">
+            {[
+              ["botFlagSource", riskSourceLabel],
+              ["Policy", riskCheck.policy || "-"],
+              ["Risk", riskCheck.risk === null || riskCheck.risk === undefined ? "-" : String(riskCheck.risk)],
+              ["Event", riskCheck.event || "-"],
+              ["会话", riskCheck.valid_session ? "有效" : "未确认"],
+              ["邮箱", emailMatchLabel],
+              ["耗时", riskCheck.response_ms === undefined ? "-" : `${riskCheck.response_ms} ms`],
+              ["检查时间", riskCheck.checked_at || "-"],
+            ].map(([label, value]) => (
+              <div key={label} className="min-w-0 bg-white px-3 py-2.5">
+                <dt className="text-[11px] font-medium text-muted-foreground">{label}</dt>
+                <dd className="mt-1 break-all text-xs font-medium text-foreground">{value}</dd>
+              </div>
+            ))}
+          </dl>
+          {riskCheck.bot_flag_details || riskCheck.error ? (
+            <div className="space-y-1 border-t border-slate-200 px-3 py-2.5 text-xs leading-5">
+              {riskCheck.bot_flag_details ? <p className="break-words text-slate-700">{riskCheck.bot_flag_details}</p> : null}
+              {riskCheck.error ? <p className="break-words text-red-700">检查错误：{riskCheck.error}</p> : null}
+            </div>
+          ) : null}
+        </section>
+      ) : null}
 
       {detail.screenshot_url ? (
         <div className="overflow-hidden rounded-xl border border-rose-200 bg-rose-50/50">
@@ -440,14 +647,18 @@ function AccountDetails({
           className="col-span-2"
           variant="outline"
           onClick={() => onRelogin(detail)}
-          disabled={reloginRunning || !detail.email || !detail.password}
+          disabled={reloginTaskRunning || !detail.email || !detail.password}
         >
           {reloginRunning ? (
             <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
           ) : (
             <LogIn className="h-4 w-4" aria-hidden="true" />
           )}
-          {reloginRunning ? "正在重新登录" : "重新登录并刷新 SSO"}
+          {reloginRunning
+            ? reloginStage || "正在重新登录"
+            : reloginTaskRunning
+              ? "其他账号正在重新登录"
+              : "重新登录并刷新 SSO"}
         </Button>
       </div>
     </div>
@@ -455,6 +666,7 @@ function AccountDetails({
 }
 
 export function AccountsPage() {
+  const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const initialStatus = searchParams.get("status") || "";
   const initialKeyword = searchParams.get("q") || "";
@@ -475,7 +687,9 @@ export function AccountsPage() {
   const [pageSize, setPageSize] = useState(50);
   const [total, setTotal] = useState(0);
   const [hasMore, setHasMore] = useState(false);
+  const [selectingAll, setSelectingAll] = useState(false);
   const [relogin, setRelogin] = useState<ReloginStatus | null>(null);
+  const [ssoCheckRunning, setSsoCheckRunning] = useState(false);
   const [reloginPolling, setReloginPolling] = useState(true);
   const [reloginReport, setReloginReport] = useState<ReloginStatus | null>(null);
   // 已上报过的 run_id，挡住重复弹窗；挂载时看到的陈旧任务只登记基线、不展示。
@@ -483,7 +697,7 @@ export function AccountsPage() {
   // 本次是否真的观察到运行中。用 ref 而非闭包变量：StrictMode 下 effect 会重建。
   const sawRunningRef = useRef(false);
   const [batchMenuOpen, setBatchMenuOpen] = useState(false);
-  const [batchBusy, setBatchBusy] = useState<"" | "export-cpa" | "export-grok2api" | "relogin">("");
+  const [batchBusy, setBatchBusy] = useState<"" | "export-cpa" | "export-grok2api" | "relogin" | "sso-check">("");
   const [deleteDialog, setDeleteDialog] = useState<{ ids: number[]; email: string } | null>(null);
   const [deleteBusy, setDeleteBusy] = useState<"" | "files" | "database">("");
   const [grok2apiImportingId, setGrok2apiImportingId] = useState<number | null>(null);
@@ -566,6 +780,26 @@ export function AccountsPage() {
   }, []);
 
   useEffect(() => {
+    let active = true;
+    let timer: number | undefined;
+    const poll = async () => {
+      try {
+        const result = await api.ssoCheckStatus();
+        if (!active) return;
+        setSsoCheckRunning(!!result.sso_check.running);
+        if (result.sso_check.running) timer = window.setTimeout(poll, 2500);
+      } catch {
+        if (active) timer = window.setTimeout(poll, 5000);
+      }
+    };
+    void poll();
+    return () => {
+      active = false;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, []);
+
+  useEffect(() => {
     if (!reloginPolling) return;
     let active = true;
     let timer: number | undefined;
@@ -645,6 +879,30 @@ export function AccountsPage() {
     });
   };
 
+  const selectAllFiltered = async () => {
+    setSelectingAll(true);
+    try {
+      const result = await api.accountIds({
+        status,
+        emailDisableStatus,
+        q: keyword,
+        batchId: batchIdFilter || undefined,
+        botRisk: botRiskFilter || undefined,
+      });
+      setSelected(Object.fromEntries((result.ids || []).map((id) => [id, true])));
+      showToast(`已选择当前筛选结果 ${result.total} 个账号`, "success");
+    } catch (err: any) {
+      showToast(err.message || "全选筛选结果失败", "error");
+    } finally {
+      setSelectingAll(false);
+    }
+  };
+
+  const clearSelection = () => {
+    setSelected({});
+    setBatchMenuOpen(false);
+  };
+
   const onCopy = async (value: string, label: string) => {
     const ok = await copyText(value);
     showToast(ok ? `已复制${label}` : "复制失败", ok ? "success" : "error");
@@ -722,7 +980,6 @@ export function AccountsPage() {
     setReloginPolling(false);
     if (next.run_id) {
       setReloginReport(next);
-      setReportOpen(true);
       await appendReloginHistory(next);
     }
     await load();
@@ -730,7 +987,7 @@ export function AccountsPage() {
 
   const onBatchRelogin = async () => {
     if (!selectedIds.length) return;
-    if (!window.confirm(`按顺序重新登录选中的 ${selectedIds.length} 个账号并刷新授权文件？`)) return;
+    if (!window.confirm(`按顺序重新登录选中的 ${selectedIds.length} 个账号，检查风控并刷新授权文件？`)) return;
     setBatchMenuOpen(false);
     setBatchBusy("relogin");
     try {
@@ -739,6 +996,28 @@ export function AccountsPage() {
       showToast("已启动批量重新登录", "success");
     } catch (err: any) {
       showToast(err.message || "启动批量重新登录失败", "error");
+    } finally {
+      setBatchBusy("");
+    }
+  };
+
+  const onBatchSsoCheck = async () => {
+    if (!selectedIds.length) return;
+    setBatchMenuOpen(false);
+    setBatchBusy("sso-check");
+    try {
+      const prepared = await api.prepareSsoCheck(selectedIds);
+      if (!prepared.ids.length) throw new Error("所选账号均缺少有效 SSO");
+      window.sessionStorage.setItem("grok-sso-check-selection", JSON.stringify(prepared.ids));
+      if (prepared.unavailable.length) {
+        window.sessionStorage.setItem(
+          "grok-sso-check-selection-note",
+          `已跳过 ${prepared.unavailable.length} 个缺少有效 SSO 的账号`
+        );
+      }
+      navigate("/accounts/sso-check?prepared=1");
+    } catch (err: any) {
+      showToast(err.message || "准备 SSO 详细检查失败", "error");
     } finally {
       setBatchBusy("");
     }
@@ -788,12 +1067,15 @@ export function AccountsPage() {
     }
   };
 
-  const onRelogin = async (item: AccountRecord) => {
+  const onRelogin = async (item: AccountRecord, confirm = true) => {
     if (!item.email || !item.password) {
       showToast("该记录缺少邮箱或密码", "error");
       return;
     }
-    if (!window.confirm(`使用已保存的账号密码重新登录 ${item.email}，刷新 SSO 和授权文件？`)) return;
+    if (
+      confirm
+      && !window.confirm(`使用已保存的账号密码重新登录 ${item.email}，刷新 SSO、检查风控并重建授权文件？`)
+    ) return;
     try {
       const result = await api.startRelogin(item.id);
       await afterReloginStart(result.relogin);
@@ -933,37 +1215,7 @@ export function AccountsPage() {
     <div className="space-y-5 sm:space-y-6">
       <PageHeader
         title="账号管理"
-        description="筛选和查看注册结果，在手机端使用卡片列表，在大屏设备上使用数据表格。"
-        actions={
-          <>
-            <Button variant="outline" onClick={() => void load(page, pageSize)} disabled={loading}>
-              <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} aria-hidden="true" />
-              刷新
-            </Button>
-            <Link to="/accounts/relogin/history" className={buttonVariants({ variant: "outline" })}>
-              <History className="h-4 w-4" aria-hidden="true" />
-              登录历史
-            </Link>
-            <Link to="/accounts/relogin" className={buttonVariants({ variant: "outline" })}>
-              <LogIn className="h-4 w-4" aria-hidden="true" />
-              重登中心
-            </Link>
-            <AccountBatchActions
-              selectedCount={selectedIds.length}
-              busy={!!batchBusy}
-              menuOpen={batchMenuOpen}
-              reloginRunning={!!relogin?.running}
-              onToggleMenu={() => setBatchMenuOpen((open) => !open)}
-              onCloseMenu={() => setBatchMenuOpen(false)}
-              onExport={(kind) => void onBatchExport(kind)}
-              onRelogin={() => void onBatchRelogin()}
-              onDelete={() => {
-                setBatchMenuOpen(false);
-                openDeleteDialog(selectedIds);
-              }}
-            />
-          </>
-        }
+        description="集中筛选账号、查看注册与授权状态；选中账号后可批量风控检查、重新登录、导出或删除。"
       />
 
       {relogin?.running ? (
@@ -1012,88 +1264,89 @@ export function AccountsPage() {
           <Link to="/accounts" className="ml-3 text-sky-700 underline-offset-2 hover:underline">清除</Link>
         </div>
       ) : null}
-      <Card>
-        <CardContent className="grid gap-3 p-4 sm:grid-cols-2 lg:grid-cols-[140px_170px_150px_minmax(0,1fr)_auto]">
-          <Select
-            value={status}
-            onChange={(e) => {
-              setStatus(e.target.value);
-              setSelected({});
-            }}
-            aria-label="按状态筛选"
-          >
-            <option value="">全部状态</option>
-            <option value="success">success</option>
-            <option value="failure">failure</option>
-            <option value="skipped">skipped</option>
-            <option value="cancelled">cancelled</option>
-          </Select>
-          <Select
-            value={emailDisableStatus}
-            onChange={(e) => {
-              setEmailDisableStatus(e.target.value);
-              setSelected({});
-            }}
-            aria-label="按邮箱停用状态筛选"
-          >
-            <option value="">全部停用状态</option>
-            <option value="success">已停用</option>
-            <option value="failed">停用失败</option>
-            <option value="skipped_cpa">CPA 未成功</option>
-            <option value="feature_disabled">功能关闭</option>
-            <option value="unsupported_source">非 accounts</option>
-            <option value="not_attempted">未执行</option>
-            <option value="not_applicable">不适用</option>
-          </Select>
-          <Select
-            value={botRiskFilter}
-            onChange={(e) => {
-              setBotRiskFilter(e.target.value);
-              setSelected({});
-            }}
-            aria-label="按风控标记筛选"
-          >
-            <option value="">不限</option>
-            <option value="1">风控标记</option>
-            <option value="0">正常账号</option>
-          </Select>
-          <div className="relative min-w-0 sm:col-span-2 lg:col-span-1">
-            <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
-            <Input
-              className="pl-9"
-              type="search"
-              placeholder="搜索邮箱、服务商、失败原因或 Batch"
-              value={keyword}
+      <Card className="overflow-hidden">
+        <AccountFilterBar actions={<Button onClick={() => { setSelected({}); void load(1, pageSize); }} disabled={loading}><Search className="h-4 w-4" aria-hidden="true" />查询</Button>}>
+            <div className="w-full sm:w-44"><label htmlFor="account-status-filter" className="mb-1.5 block text-xs font-medium text-slate-500">注册状态</label>
+            <Select
+              id="account-status-filter"
+              value={status}
               onChange={(e) => {
-                setKeyword(e.target.value);
+                setStatus(e.target.value);
                 setSelected({});
               }}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  setSelected({});
-                  void load(1, pageSize);
-                }
+              aria-label="按状态筛选"
+            >
+              <option value="">全部状态</option>
+              <option value="success">success</option>
+              <option value="failure">failure</option>
+              <option value="skipped">skipped</option>
+              <option value="cancelled">cancelled</option>
+            </Select>
+            </div>
+            <div className="w-full sm:w-48"><label htmlFor="account-email-status-filter" className="mb-1.5 block text-xs font-medium text-slate-500">邮箱状态</label>
+            <Select
+              id="account-email-status-filter"
+              value={emailDisableStatus}
+              onChange={(e) => {
+                setEmailDisableStatus(e.target.value);
+                setSelected({});
               }}
-              aria-label="搜索账号记录"
-            />
-          </div>
-          <Button
-            className="sm:col-span-2 lg:col-span-1"
-            onClick={() => {
-              setSelected({});
-              void load(1, pageSize);
-            }}
-            disabled={loading}
-          >
-            <Search className="h-4 w-4" aria-hidden="true" />
-            查询
-          </Button>
-        </CardContent>
+              aria-label="按邮箱停用状态筛选"
+            >
+              <option value="">全部停用状态</option>
+              <option value="success">已停用</option>
+              <option value="failed">停用失败</option>
+              <option value="skipped_cpa">CPA 未成功</option>
+              <option value="feature_disabled">功能关闭</option>
+              <option value="unsupported_source">非 accounts</option>
+              <option value="not_attempted">未执行</option>
+              <option value="not_applicable">不适用</option>
+            </Select>
+            </div>
+            <div className="w-full sm:w-44"><label htmlFor="account-risk-filter" className="mb-1.5 block text-xs font-medium text-slate-500">风控状态</label>
+            <Select
+              id="account-risk-filter"
+              value={botRiskFilter}
+              onChange={(e) => {
+                setBotRiskFilter(e.target.value);
+                setSelected({});
+              }}
+              aria-label="按风控标记筛选"
+            >
+              <option value="">不限</option>
+              <option value="1">异常账号</option>
+              <option value="0">正常账号</option>
+              <option value="unknown">未检查 / 未知</option>
+            </Select>
+            </div>
+            <div className="w-full min-w-0 sm:min-w-72 sm:flex-1"><label htmlFor="account-search" className="mb-1.5 block text-xs font-medium text-slate-500">搜索账号</label><div className="relative">
+              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
+              <Input
+                id="account-search"
+                className="pl-9"
+                type="search"
+                placeholder="搜索邮箱、服务商、失败原因或 Batch"
+                value={keyword}
+                onChange={(e) => {
+                  setKeyword(e.target.value);
+                  setSelected({});
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    setSelected({});
+                    void load(1, pageSize);
+                  }
+                }}
+                aria-label="搜索账号记录"
+              />
+            </div>
+            </div>
+        </AccountFilterBar>
       </Card>
 
       <div>
         <Card className="min-w-0 overflow-hidden">
-          <CardHeader className="flex-row items-center justify-between gap-3">
+          <CardHeader>
             <div>
               <CardTitle>注册记录</CardTitle>
               <CardDescription>
@@ -1101,15 +1354,19 @@ export function AccountsPage() {
                 {selectedIds.length ? `，已选 ${selectedIds.length} 条` : ""}。
               </CardDescription>
             </div>
-            <label className="flex min-h-11 cursor-pointer items-center gap-2 rounded-xl px-2 text-sm text-muted-foreground hover:bg-muted xl:hidden">
-              <input
-                type="checkbox"
-                checked={allVisibleSelected}
-                onChange={(e) => toggleAll(e.target.checked)}
-              />
-              全选本页
-            </label>
           </CardHeader>
+          <AccountSelectionToolbar
+            allVisibleSelected={allVisibleSelected}
+            selectableCount={items.length}
+            selectedCount={selectedIds.length}
+            total={total}
+            loading={loading}
+            selectingAll={selectingAll}
+            onTogglePage={toggleAll}
+            onSelectAll={() => void selectAllFiltered()}
+            onClear={clearSelection}
+            actions={<><Button size="sm" variant="outline" onClick={() => void load(page, pageSize)} disabled={loading}><RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} aria-hidden="true" />刷新</Button><AccountBatchActions selectedCount={selectedIds.length} busy={!!batchBusy} menuOpen={batchMenuOpen} reloginRunning={!!relogin?.running} ssoCheckRunning={ssoCheckRunning || batchBusy === "sso-check"} taskConflict={!!relogin?.running || ssoCheckRunning} onToggleMenu={() => setBatchMenuOpen((open) => !open)} onCloseMenu={() => setBatchMenuOpen(false)} onExport={(kind) => void onBatchExport(kind)} onRelogin={() => void onBatchRelogin()} onSsoCheck={() => void onBatchSsoCheck()} onDelete={() => { setBatchMenuOpen(false); openDeleteDialog(selectedIds); }} /></>}
+          />
           <CardContent className="p-0">
             {items.length === 0 ? (
               <div className="p-4 sm:p-6">
@@ -1137,6 +1394,14 @@ export function AccountsPage() {
                           </div>
                           <div className="mt-2 space-y-2">
                             <MobileStatusGrid item={item} />
+                            <ReloginRecoveryHint
+                              item={item}
+                              compact
+                              running={!!relogin?.running && relogin.account_id === item.id}
+                              taskRunning={!!relogin?.running}
+                              stage={relogin?.stage || ""}
+                              onRelogin={onRelogin}
+                            />
                             <div className="flex justify-end">
                               <Badge variant={emailDisableVariant(item.email_disable_status)}>
                                 <Power className="mr-1 h-3 w-3" aria-hidden="true" />
@@ -1149,8 +1414,8 @@ export function AccountsPage() {
 
                       <div className="grid grid-cols-2 gap-2 rounded-xl bg-muted/40 p-3 text-xs leading-5 text-muted-foreground">
                         <div>
-                          <span className="block">服务商</span>
-                          <strong className="block truncate font-medium text-foreground">{item.provider || "-"}</strong>
+                          <span className="block">邮箱来源</span>
+                          <EmailProviderLabel provider={item.provider} className="mt-1" />
                         </div>
                         <div>
                           <span className="block">耗时</span>
@@ -1230,6 +1495,18 @@ export function AccountsPage() {
                               <div className="min-w-0">
                                 <div className="truncate font-medium text-foreground" title={item.email}>{item.email || "-"}</div>
                                 <div className="mt-0.5 truncate text-[11px] text-muted-foreground">{item.finished_at || "未记录时间"}</div>
+                                {reloginRecoveryKind(item) ? (
+                                  <div className="mt-2">
+                                    <ReloginRecoveryHint
+                                      item={item}
+                                      compact
+                                      running={!!relogin?.running && relogin.account_id === item.id}
+                                      taskRunning={!!relogin?.running}
+                                      stage={relogin?.stage || ""}
+                                      onRelogin={onRelogin}
+                                    />
+                                  </div>
+                                ) : null}
                               </div>
                             </div>
                           </td>
@@ -1268,7 +1545,7 @@ export function AccountsPage() {
                             ) : null}
                           </td>
                           <td className={`border-b border-slate-100 px-3 py-3 text-muted-foreground transition-colors ${detail?.id === item.id ? "bg-sky-50" : "bg-white group-hover:bg-slate-50"}`}>
-                            <span className="inline-flex rounded-md bg-slate-100 px-2 py-1 text-xs font-medium text-slate-600">{item.provider || "-"}</span>
+                            <EmailProviderLabel provider={item.provider} />
                           </td>
                           <td className={`border-b border-slate-100 px-3 py-3 tabular-nums text-muted-foreground transition-colors ${detail?.id === item.id ? "bg-sky-50" : "bg-white group-hover:bg-slate-50"}`}>{formatDuration(item.duration_seconds)}</td>
                           <td className={`sticky right-0 z-[5] border-b border-slate-100 px-3 py-3 shadow-[-10px_0_18px_-18px_rgba(15,23,42,0.3)] transition-colors ${detail?.id === item.id ? "bg-sky-50" : "bg-white group-hover:bg-slate-50"}`}>
@@ -1418,6 +1695,8 @@ export function AccountsPage() {
                 authJsonLoading={authJsonLoading}
                 onRelogin={onRelogin}
                 reloginRunning={!!relogin?.running && relogin.account_id === detail.id}
+                reloginTaskRunning={!!relogin?.running}
+                reloginStage={relogin?.stage || ""}
               />
             </div>
           </section>

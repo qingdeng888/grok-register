@@ -1,8 +1,16 @@
 import { useEffect, useMemo, useState } from "react";
 import { NavLink, Outlet, useLocation } from "react-router-dom";
-import { Activity, Database, LogOut, Menu, MoreHorizontal, PanelLeftClose, PanelLeftOpen, X } from "lucide-react";
+import { Activity, Database, LogOut, Menu, MoreHorizontal, PanelLeftClose, PanelLeftOpen, RefreshCw, X } from "lucide-react";
 import { mobilePrimaryItems, navigationGroups, navigationItems } from "@/app/navigation";
+import { UPDATE_SNAPSHOT_EVENT, UpdateNotice } from "@/components/UpdateNotice";
+import { Toast } from "@/components/ui";
+import { api } from "@/lib/api";
 import { cn } from "@/lib/utils";
+
+function navigationActive(pathname: string, to: string) {
+  if (to === "/accounts") return pathname === to;
+  return pathname === to || pathname.startsWith(`${to}/`);
+}
 
 function StatusPill({ running, compact = false }: { running?: boolean; compact?: boolean }) {
   return (
@@ -35,30 +43,31 @@ function Brand() {
 }
 
 function NavigationContent({ onNavigate, collapsed = false }: { onNavigate?: () => void; collapsed?: boolean }) {
+  const location = useLocation();
   return (
     <nav className="flex flex-col gap-5" aria-label="主导航">
       {navigationGroups.map((group) => (
         <section key={group.label}>
           {collapsed ? <div className="mx-2 mb-2 border-t border-slate-100" /> : <div className="mb-1.5 px-3 text-[11px] font-medium uppercase tracking-[0.08em] text-slate-400">{group.label}</div>}
-          <div className="space-y-0.5">
+          <div className={cn("space-y-0.5", group.label === "账号中心" && !collapsed && "border-l border-slate-200 pl-2")}>
             {group.items.map((item) => {
               const Icon = item.icon;
+              const active = navigationActive(location.pathname, item.to);
               return (
                 <NavLink
                   key={item.to}
                   to={item.to}
-                  end={item.to !== "/accounts/relogin/history"}
+                  end={item.to === "/accounts"}
                   onClick={onNavigate}
                   title={collapsed ? item.label : undefined}
-                  className={({ isActive }) =>
-                    cn(
-                      "relative flex min-h-10 items-center gap-3 rounded-lg px-3 text-sm transition-colors",
-                      collapsed && "justify-center px-2",
-                      isActive
-                        ? "bg-sky-50 font-medium text-sky-700"
-                        : "text-slate-600 hover:bg-slate-50 hover:text-slate-950"
-                    )
-                  }
+                  aria-current={active ? "page" : undefined}
+                  className={cn(
+                    "relative flex min-h-10 items-center gap-3 rounded-lg px-3 text-sm transition-colors",
+                    collapsed && "justify-center px-2",
+                    active
+                      ? "bg-sky-50 font-medium text-sky-700"
+                      : "text-slate-600 hover:bg-slate-50 hover:text-slate-950"
+                  )}
                 >
                   <Icon className="h-4 w-4 shrink-0" strokeWidth={1.8} aria-hidden="true" />
                   <span className={cn("truncate", collapsed && "sr-only")}>{item.label}</span>
@@ -75,6 +84,11 @@ function NavigationContent({ onNavigate, collapsed = false }: { onNavigate?: () 
 export function Layout({ jobRunning, onLogout }: { jobRunning?: boolean; onLogout?: () => void }) {
   const location = useLocation();
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [updateToast, setUpdateToast] = useState<{ message: string; tone: "success" | "error" }>({
+    message: "",
+    tone: "success",
+  });
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
     try {
       return window.localStorage.getItem("grok-sidebar-collapsed") === "1";
@@ -90,7 +104,7 @@ export function Layout({ jobRunning, onLogout }: { jobRunning?: boolean; onLogou
     [location.pathname]
   );
   const primaryActive = mobilePrimaryItems.some(
-    (item) => location.pathname === item.to || location.pathname.startsWith(`${item.to}/`)
+    (item) => navigationActive(location.pathname, item.to)
   );
 
   useEffect(() => setMobileMenuOpen(false), [location.pathname]);
@@ -107,9 +121,48 @@ export function Layout({ jobRunning, onLogout }: { jobRunning?: boolean; onLogou
       document.body.style.overflow = "";
     };
   }, [mobileMenuOpen]);
+  useEffect(() => {
+    if (!updateToast.message) return;
+    const timer = window.setTimeout(
+      () => setUpdateToast((current) => ({ ...current, message: "" })),
+      4000,
+    );
+    return () => window.clearTimeout(timer);
+  }, [updateToast.message]);
+
+  const checkForUpdates = async () => {
+    if (checkingUpdate) return;
+    setCheckingUpdate(true);
+    try {
+      const response = await api.checkForUpdates();
+      const version = response.version;
+      window.dispatchEvent(
+        new CustomEvent(UPDATE_SNAPSHOT_EVENT, { detail: { version } }),
+      );
+      if (version.status === "check_failed") {
+        setUpdateToast({ message: version.error || "检查更新失败", tone: "error" });
+      } else if (version.updateAvailable) {
+        setUpdateToast({ message: `发现新版本 ${version.latestVersion}`, tone: "success" });
+      } else {
+        setUpdateToast({
+          message: `当前已是最新版本 ${version.currentVersion}`,
+          tone: "success",
+        });
+      }
+    } catch (error) {
+      setUpdateToast({
+        message: error instanceof Error ? error.message : "检查更新失败",
+        tone: "error",
+      });
+    } finally {
+      setCheckingUpdate(false);
+    }
+  };
 
   return (
     <div className="min-h-[100dvh] bg-[#f7f8f7] text-foreground">
+      <UpdateNotice />
+      <Toast message={updateToast.message} tone={updateToast.tone} />
       <a
         href="#main-content"
         className="fixed left-3 top-3 z-[100] -translate-y-24 rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white transition-transform focus:translate-y-0"
@@ -131,6 +184,17 @@ export function Layout({ jobRunning, onLogout }: { jobRunning?: boolean; onLogou
           </button>
         </div>
         <div className="flex items-center gap-2 text-xs text-slate-500">
+          <button
+            type="button"
+            onClick={() => void checkForUpdates()}
+            disabled={checkingUpdate}
+            className="flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 font-medium text-slate-600 hover:bg-slate-50 hover:text-slate-950 disabled:cursor-wait disabled:opacity-60"
+            aria-label={checkingUpdate ? "正在检查更新" : "检查更新"}
+            title={checkingUpdate ? "正在检查更新" : "检查更新"}
+          >
+            <RefreshCw className={cn("h-3.5 w-3.5", checkingUpdate && "animate-spin")} aria-hidden="true" />
+            <span className="hidden sm:inline">{checkingUpdate ? "检查中" : "检查更新"}</span>
+          </button>
           <span className="hidden sm:inline">本地控制台</span>
           <StatusPill running={jobRunning} compact />
         </div>
@@ -266,17 +330,17 @@ export function Layout({ jobRunning, onLogout }: { jobRunning?: boolean; onLogou
       >
         {mobilePrimaryItems.map((item) => {
           const Icon = item.icon;
+          const active = navigationActive(location.pathname, item.to);
           return (
             <NavLink
               key={item.to}
               to={item.to}
               end={item.to === "/accounts"}
-              className={({ isActive }) =>
-                cn(
-                  "flex min-h-[62px] flex-col items-center justify-center gap-1 text-[11px] font-medium",
-                  isActive ? "text-sky-600" : "text-slate-500"
-                )
-              }
+              aria-current={active ? "page" : undefined}
+              className={cn(
+                "flex min-h-[62px] flex-col items-center justify-center gap-1 text-[11px] font-medium",
+                active ? "text-sky-600" : "text-slate-500"
+              )}
             >
               <Icon className="h-5 w-5" strokeWidth={1.8} aria-hidden="true" />
               <span>{item.shortLabel}</span>

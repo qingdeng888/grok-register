@@ -26,7 +26,10 @@ from curl_cffi import requests
 
 # 授权交换和导出逻辑集中在 integrations 包，编排层只负责调用。
 from backend.integrations import auth_exchange as _s2cpa
+from backend.integrations import grokiq as _grokiq
 from backend.integrations import grok2api_client as _grok2api
+from backend.integrations import sub2api_client as _sub2api
+from backend.integrations import sso_checker as _sso_checker
 from backend.mailbox import cloudflare_worker as cloudflare_provider
 from backend.mailbox import cloud_mail as cloudmail_provider
 from backend.mailbox import duck_mail as duckmail_provider
@@ -42,7 +45,7 @@ from backend.automation import session as _bs
 from backend.registration import signup_flow as _rf
 from backend.integrations import network_checks as _conn
 from backend.registration.store import RegistrationRepository
-from backend.integrations.proxy import resolve_proxy_url
+from backend.integrations.proxy import redact_proxy_text, redact_proxy_url, resolve_proxy_url
 from backend.shared.paths import DATA_ROOT, PROJECT_ROOT
 from backend.automation.session import (
     browser,
@@ -238,15 +241,15 @@ def backfill_registration_risk_bot_risk(log_callback=None) -> int:
             log_callback(f"[!] 注册风控 bot_risk 回填失败: {exc}")
         return 0
     if updated and log_callback:
-        log_callback(f"[*] 已回填注册风控 bot_risk 标记 {updated} 条")
+        log_callback(f"[*] 已回填或修正注册风控记录 {updated} 条")
     return updated
 
 
 def email_registered_successfully(email):
     """数据库或旧账号文件中已有成功/已消耗记录时返回 True。
 
-    除正式 success 外，已保存 SSO、已判定 already_registered、或已尝试停用
-    的 Outlook 邮箱也应跳过，避免邮箱池重复取用造成死循环。
+    除正式 success 外，已保存 SSO、已判定 already_registered / registration_risk /
+    sso_timeout，或已尝试停用的 Outlook 邮箱也应跳过，避免邮箱池重复取用造成死循环。
     """
     normalized = str(email or "").strip()
     if not normalized:
@@ -260,6 +263,20 @@ def email_registered_successfully(email):
     except Exception:
         pass
     return os.path.isfile(account_file_for_email(normalized))
+
+
+def _environment_int(name, default):
+    try:
+        return int(os.environ.get(name, str(default)) or default)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _environment_bool(name, default=False):
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
 DEFAULT_CONFIG = {
@@ -295,6 +312,9 @@ DEFAULT_CONFIG = {
     "proxy": "http://127.0.0.1:7890",
     "enable_nsfw": True,
     "debug_mode": False,
+    "browser_engine": _bs.normalize_browser_engine(
+        os.environ.get("GROK_BROWSER_ENGINE", "camoufox")
+    ),
     "browser_headless": False,
     "browser_locale": "en-US",
     "close_browser_on_stop": False,
@@ -304,6 +324,8 @@ DEFAULT_CONFIG = {
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
     # CLIProxyAPI(CPA) 直出：注册拿到 SSO 后换 token，写入 CPA / Grok2API
     "cpa_auto_add": True,
+    # 获取 SSO 后使用完整账号页解析器复查会话、邮箱与 botFlag 风控字段。
+    "sso_detailed_risk_check": False,
     # Token 换取方式：device_protocol（协议 Device Flow，默认）/ device_browser（浏览器 Device Flow）/ auth_code
     "cpa_token_mode": "device_protocol",
     # CPA 本地 auth 目录
@@ -318,6 +340,28 @@ DEFAULT_CONFIG = {
     "grok2api_remote_username": "",
     "grok2api_remote_password": "",
     "grok2api_auto_import": True,
+    "grok2api_auto_import_build": True,
+    "grok2api_auto_import_web": False,
+    "grok2api_auto_import_console": False,
+    # CPA 远程上传开关（独立于 cpa_auto_add；后者控制整个 SSO→auth 链路）
+    "cpa_upload_enabled": True,
+    # Sub2API：注册拿到 SSO 后直接上传 sso-to-oauth
+    "sub2api_enabled": False,
+    "sub2api_remote_url": "",
+    "sub2api_api_key": "",
+    "sub2api_group_ids": "",  # 逗号分隔字符串，如 "1,2"
+    "sub2api_proxy_id": 0,
+    "sub2api_concurrency": 1,
+    "sub2api_priority": 0,
+    "sub2api_name_prefix": "",
+    "grokiq_webhook_enabled": _environment_bool(
+        "GROKIQ_WEBHOOK_ENABLED", False
+    ),
+    "grokiq_webhook_url": os.environ.get("GROKIQ_WEBHOOK_URL", ""),
+    "grokiq_webhook_token": os.environ.get("GROKIQ_WEBHOOK_TOKEN", ""),
+    "grokiq_webhook_timeout_seconds": _environment_int(
+        "GROKIQ_WEBHOOK_TIMEOUT_SECONDS", 10
+    ),
     "mailnest_api_key": "",
     "mailnest_project_code": "x-ai001",
     # YYDS：留空自动选已验证域名；填写则固定该域名
@@ -360,17 +404,25 @@ class RegistrationRiskDenied(Exception):
 
     携带 botFlagSource：它与 access_token 里的 bfs 声明是同一个字段，
     只是一个来自注册后的账号状态页、一个来自换到的 token。所以注册风控
-    拒绝的账号要和 bfs=1 一样标记 bot_risk，前端才会显示盾牌图标。
+    拒绝的账号要和 bfs 非 0 一样标记 bot_risk，前端才会显示盾牌图标。
     """
 
-    def __init__(self, message, *, bot_risk=False, bot_flag_source=None, bot_flag_details=""):
+    def __init__(
+        self,
+        message,
+        *,
+        bot_risk=False,
+        bot_flag_source=None,
+        bot_flag_details="",
+        risk_state=None,
+    ):
         super().__init__(message)
-        # bot_risk 由抛出点显式给出，不从 bot_flag_source 反推：服务端可能
-        # policy=deny 裁决拒绝而 botFlagSource 仍解析为 0/null，那也是风控标记；
-        # 反过来"sso 为空"这类前置条件失败不是裁决，不能标。
+        # bot_risk 由抛出点显式给出；当前服务端规则仅以
+        # botFlagSource 非 0 为异常，"sso 为空"等前置失败不标记。
         self.bot_risk = bool(bot_risk)
         self.bot_flag_source = bot_flag_source
         self.bot_flag_details = str(bot_flag_details or "")
+        self.risk_state = dict(risk_state or {})
 
 
 def apply_risk_bot_flag(cpa_detail: dict, exc) -> bool:
@@ -386,6 +438,9 @@ def apply_risk_bot_flag(cpa_detail: dict, exc) -> bool:
     source = getattr(exc, "bot_flag_source", None)
     cpa_detail["bot_risk"] = True
     cpa_detail["bfs"] = "" if source is None else source
+    risk_state = getattr(exc, "risk_state", None)
+    if isinstance(risk_state, dict) and risk_state:
+        cpa_detail["sso_risk_check"] = dict(risk_state)
     return True
 
 
@@ -610,10 +665,16 @@ def persist_registration_result(
         extra_data["cpa_error"] = str(detail.get("error"))
     if detail.get("mode"):
         extra_data["cpa_mode"] = str(detail.get("mode"))
+    if isinstance(detail.get("sso_risk_check"), dict):
+        extra_data["sso_risk_check"] = dict(detail["sso_risk_check"])
+    # Sub2API 摘要结果放入 extra，便于后续详情页展示
+    if detail.get("sub2api_remote_result") is not None:
+        extra_data["sub2api_remote_result"] = detail.get("sub2api_remote_result")
     disable_detail = default_email_disable_detail(provider_name, detail)
     disable_detail.update(dict(email_disable_detail or {}))
     try:
-        return get_registration_repository().add_result(
+        repository = get_registration_repository()
+        registration_id = repository.add_result(
             {
                 "batch_id": batch_id,
                 "source": source,
@@ -642,6 +703,13 @@ def persist_registration_result(
                     "grok2api_remote_imported_at", ""
                 ),
                 "grok2api_remote_error": detail.get("grok2api_remote_error", ""),
+                "sub2api_remote_status": detail.get(
+                    "sub2api_remote_status", "disabled"
+                ),
+                "sub2api_remote_imported_at": detail.get(
+                    "sub2api_remote_imported_at", ""
+                ),
+                "sub2api_remote_error": detail.get("sub2api_remote_error", ""),
                 "email_account_id": disable_detail.get("account_id", ""),
                 "email_disable_status": disable_detail.get("status", "not_attempted"),
                 "email_disabled_at": disable_detail.get("disabled_at", ""),
@@ -657,6 +725,27 @@ def persist_registration_result(
                 "extra": extra_data,
             }
         )
+        if _grokiq.grok_build_import_succeeded(
+            detail.get("grok2api_remote_result")
+        ):
+            try:
+                record = repository.get_results_by_ids([registration_id])[0]
+                event = _grokiq.enqueue_imported_account(
+                    repository,
+                    record,
+                    config,
+                )
+                if event and log_callback:
+                    log_callback(
+                        "[GrokIQ] 已加入联动通知队列: "
+                        f"{event.get('event_id')}"
+                    )
+            except Exception as grokiq_exc:
+                if log_callback:
+                    log_callback(
+                        f"[GrokIQ] 账号已导入 Grok2API，但联动通知入队失败: {grokiq_exc}"
+                    )
+        return registration_id
     except Exception as exc:
         if log_callback:
             log_callback(f"[!] SQLite 保存注册结果失败: {exc}")
@@ -673,6 +762,9 @@ def load_config():
             config = {**DEFAULT_CONFIG, **loaded}
         except Exception:
             config = DEFAULT_CONFIG.copy()
+    config["browser_engine"] = _bs.normalize_browser_engine(
+        config.get("browser_engine", "camoufox")
+    )
     return config
 
 
@@ -747,7 +839,7 @@ def _log_actual_http_route(method, url, *, proxies=None, proxy=""):
             or proxies.get("http")
             or ""
         ).strip()
-    route = f"代理 {proxy_value}" if proxy_value else "直连（不使用代理）"
+    route = f"代理 {redact_proxy_url(proxy_value)}" if proxy_value else "直连（不使用代理）"
     key = (str(method or "GET").upper(), display_url, route)
     with _network_route_log_lock:
         if key in _network_route_log_keys:
@@ -952,13 +1044,48 @@ def disable_outlookemail_after_cpa_success(email, cpa_detail=None, log_callback=
     return detail
 
 
+def maybe_disable_outlookemail_for_consumed_failure(
+    kind,
+    email,
+    *,
+    reason: str = "",
+    log_callback=None,
+) -> dict | None:
+    """账号已注册、注册风控或 SSO 超时停用 Outlook 邮箱；邮箱已消耗，避免再次取用。"""
+    if kind not in {FAIL_ALREADY_REGISTERED, FAIL_RISK, FAIL_SSO}:
+        return None
+    if not is_outlookemail_registration() or not str(email or "").strip():
+        return None
+    label = FAIL_LABELS.get(kind, kind)
+    fail_email = str(email).strip()
+    if log_callback:
+        log_callback(f"[*] {label}，按自动停用开关处理 Outlook 邮箱: {fail_email}")
+    detail = disable_outlookemail_consumed(
+        fail_email,
+        reason=reason or label,
+        log_callback=log_callback,
+    )
+    status = str((detail or {}).get("status") or "")
+    if log_callback:
+        if status == "success":
+            log_callback(f"[+] {label}：Outlook 邮箱停用完成: {fail_email}")
+        elif status == "feature_disabled":
+            log_callback(f"[*] {label}：自动停用开关未开启，跳过停用 Outlook: {fail_email}")
+        elif status == "failed":
+            log_callback(
+                f"[!] {label}：Outlook 邮箱停用失败: {fail_email}"
+                f" — {(detail or {}).get('error') or ''}"
+            )
+    return detail
+
+
 def disable_outlookemail_consumed(
     email,
     *,
     reason: str = "",
     log_callback=None,
 ) -> dict:
-    """在账号已存在 / 已拿 SSO 等场景下停用 Outlook 邮箱，避免重复取用。
+    """在账号已存在 / 注册风控 / SSO 超时 / 已拿 SSO 等场景下停用 Outlook 邮箱，避免重复取用。
 
     与 CPA 成功后停用共用同一开关 outlookemail_disable_after_cpa_success：
     仅在开关开启且来源为 accounts 时才会远程停用。
@@ -1156,22 +1283,78 @@ def _append_sso_risk_rejected(email: str, sso: str, details: str, log_callback=N
             log_callback(f"[CPA] 保存注册风控拒绝记录失败: {exc}")
 
 
-def ensure_sso_oauth_eligible(raw_token, email="", log_callback=None) -> dict:
-    """复查新账号风控状态；无法稳定判定时不进入 OAuth。"""
-    if not config.get("cpa_auto_add", False):
-        return {}
-    if not any(
-        str(config.get(key, "") or "").strip()
-        for key in ("cpa_auth_dir", "cpa_remote_url", "grok2api_auth_dir")
-    ):
-        return {}
+def _inspect_sso_detailed_risk(sso: str, email: str, proxy: str) -> dict:
+    """使用独立 SSO Checker 返回不含凭据的详细账号与 botFlag 结果。"""
+    checker = _sso_checker.SsoChecker(
+        _sso_checker.SsoCheckConfig(
+            proxy=proxy,
+            user_agent=get_user_agent(),
+        )
+    )
+    result = checker.check(
+        _sso_checker.SsoCredential(
+            sso_token=sso,
+            expected_email=str(email or "").strip(),
+            label=str(email or "").strip(),
+        )
+    )
+    state = result.to_dict(flagged_sources=checker.config.flagged_sources)
+    bot_flag = dict(state.get("bot_flag") or {})
+    state.update(
+        {
+            "enabled": True,
+            "mode": "detailed",
+            "found": bool(bot_flag.get("found")),
+            "flagged": bool(bot_flag.get("flagged")),
+            "bot_flag_source": bot_flag.get("source"),
+            "bot_flag_details": str(bot_flag.get("details") or ""),
+            "policy": str(bot_flag.get("policy") or ""),
+            "risk": bot_flag.get("risk"),
+            "event": str(bot_flag.get("event") or ""),
+            "denied": bool(bot_flag.get("denied")),
+        }
+    )
+    return state
+
+
+def ensure_sso_oauth_eligible(
+    raw_token,
+    email="",
+    log_callback=None,
+    result_out=None,
+) -> dict:
+    """按配置复查 SSO 风控状态；详细模式同时验证会话与账号资料。"""
+    detailed = bool(config.get("sso_detailed_risk_check", False))
+    if not detailed:
+        if not config.get("cpa_auto_add", False):
+            return {}
+        if not any(
+            str(config.get(key, "") or "").strip()
+            for key in ("cpa_auth_dir", "cpa_remote_url", "grok2api_auth_dir")
+        ):
+            return {}
     sso = _normalize_sso_token(raw_token)
     if not sso:
         raise RegistrationRiskDenied("注册风控检查失败: sso 为空")
 
     def _risk_log(message):
         if log_callback:
-            log_callback(f"[CPA] {str(message).strip()}")
+            prefix = "[SSO风控]" if detailed else "[CPA]"
+            log_callback(f"{prefix} {str(message).strip()}")
+
+    def _set_risk_state(state):
+        if detailed and isinstance(result_out, dict):
+            result_out["sso_risk_check"] = dict(state or {})
+
+    def _source_status(value):
+        if value is None or value == "":
+            return "unknown"
+        if isinstance(value, bool):
+            return "flagged"
+        try:
+            return "clean" if int(value) == 0 else "flagged"
+        except (TypeError, ValueError):
+            return "unknown"
 
     retry_delays = (0, 2, 4, 8)
     proxy = _resolve_cpa_proxy()
@@ -1181,16 +1364,24 @@ def ensure_sso_oauth_eligible(raw_token, email="", log_callback=None) -> dict:
         if delay:
             _risk_log(f"风控字段尚未稳定，{delay}s 后进行第 {attempt} 次检查")
             time.sleep(delay)
-        _risk_log(f"检查新账号注册风控状态 ({attempt}/{len(retry_delays)}) ...")
-        state = _s2cpa.inspect_sso_account_state(
-            sso,
-            proxy=proxy,
-            log=_risk_log,
-        )
+        mode_label = "详细检查 SSO 会话与 botFlag" if detailed else "检查新账号注册风控状态"
+        _risk_log(f"{mode_label} ({attempt}/{len(retry_delays)}) ...")
+        if detailed:
+            state = _inspect_sso_detailed_risk(sso, email, proxy)
+        else:
+            state = _s2cpa.inspect_sso_account_state(
+                sso,
+                proxy=proxy,
+                log=_risk_log,
+            )
         last_state = state
+        _set_risk_state(state)
         source = state.get("bot_flag_source")
-        source_flagged = source not in (None, 0, "0", "")
-        if state.get("denied") or source_flagged:
+        # 服务端约定：0 为正常；null/缺失为未知；任何非零值均属于异常。
+        source_status = _source_status(source)
+        source_clean = source_status == "clean"
+        source_flagged = source_status == "flagged"
+        if source_flagged:
             details = str(
                 state.get("bot_flag_details")
                 or f"botFlagSource={source},policy=unknown,event=unknown"
@@ -1202,13 +1393,31 @@ def ensure_sso_oauth_eligible(raw_token, email="", log_callback=None) -> dict:
                 bot_risk=True,
                 bot_flag_source=source,
                 bot_flag_details=details,
+                risk_state=state,
             )
 
-        # 明确读取到非风险状态后即可继续；字段为 null 时继续短时复查，避免注册结果延迟写入。
-        if state.get("found") and (
-            source == 0
-            or str(state.get("policy") or "").lower() in {"allow", "review"}
-            or bool(state.get("bot_flag_details"))
+        # 明确读取到非风险状态后即可继续；字段为空时短时复查，避免注册结果延迟写入。
+        if detailed:
+            if (
+                state.get("valid_session")
+                and state.get("found")
+                and source_clean
+            ):
+                if state.get("email_match") is False:
+                    server_email = str((state.get("account") or {}).get("email") or "")
+                    _risk_log(
+                        "SSO 账号邮箱与本次注册邮箱不一致，继续记录检查结果: "
+                        f"expected={email or '-'} actual={server_email or '-'}"
+                    )
+                _risk_log(
+                    "详细风控检查通过: "
+                    f"botFlagSource={source!r} "
+                    f"policy={state.get('policy') or '-'} "
+                    f"risk={state.get('risk')!r}"
+                )
+                return state
+        elif state.get("found") and (
+            source in (0, "0")
         ):
             return state
 
@@ -1234,6 +1443,17 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, result_out=None) -> b
             result.update(values)
 
     cpa_enabled = bool(config.get("cpa_auto_add", False))
+    # CPA 远程上传独立开关，默认开启以保持旧行为
+    cpa_upload_enabled = bool(config.get("cpa_upload_enabled", True))
+    # Sub2API：默认关闭，需显式开启；失败不拉低注册成功判定
+    sub2api_enabled = bool(config.get("sub2api_enabled", False))
+    sub2api_configured = _sub2api.Sub2APIClient.is_configured(config)
+    if not sub2api_enabled:
+        sub2api_status = "disabled"
+    elif sub2api_configured:
+        sub2api_status = "ready"
+    else:
+        sub2api_status = "not_configured"
     _set_result(
         enabled=cpa_enabled,
         status="not_attempted" if cpa_enabled else "disabled",
@@ -1248,6 +1468,10 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, result_out=None) -> b
         grok2api_remote_status="not_configured",
         grok2api_remote_imported_at="",
         grok2api_remote_error="",
+        sub2api_remote_status=sub2api_status,
+        sub2api_remote_imported_at="",
+        sub2api_remote_error="",
+        sub2api_remote_result=None,
         bot_risk=False,
         bfs="",
         error="",
@@ -1262,6 +1486,7 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, result_out=None) -> b
     g2a_dir = str(config.get("grok2api_auth_dir", "") or "").strip()
     g2a_remote_configured = _grok2api.Grok2APIClient.is_configured(config)
     g2a_auto_import = bool(config.get("grok2api_auto_import", False))
+    g2a_import_formats = _grok2api.Grok2APIClient.auto_import_formats(config)
     _set_result(
         cpa_remote_status="ready" if remote_url and management_key else "not_configured",
         grok2api_remote_status="ready" if g2a_remote_configured else "not_configured",
@@ -1300,7 +1525,7 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, result_out=None) -> b
 
     def _cpa_log(message):
         if log_callback:
-            log_callback(f"[CPA] {str(message).strip()}")
+            log_callback(f"[CPA] {redact_proxy_text(message).strip()}")
 
     try:
         token_mode = str(config.get("cpa_token_mode", "device_protocol") or "device_protocol").lower()
@@ -1380,7 +1605,7 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, result_out=None) -> b
             except Exception as local_exc:
                 _cpa_log(f"CPA 本地写入失败: {local_exc}")
                 auth_errors.append(f"CPA 本地失败: {local_exc}")
-        if remote_url:
+        if remote_url and cpa_upload_enabled:
             try:
                 # CPA 管理端通常是本机或内网服务，远程上传固定直连；
                 # config.proxy 只用于 xAI/Grok 的 SSO→token/Auth 链路。
@@ -1403,6 +1628,10 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, result_out=None) -> b
                 _cpa_log(f"CPA 远程上传失败: {remote_exc}")
                 auth_errors.append(f"CPA 远程失败: {remote_exc}")
                 _set_result(cpa_remote_status="failed", cpa_remote_error=str(remote_exc))
+        elif remote_url and not cpa_upload_enabled:
+            # 配了远程地址但关闭上传开关：仅本地保存
+            _cpa_log("已配置 CPA 远程地址，但上传开关关闭，仅保存本地")
+            _set_result(cpa_remote_status="disabled")
         if g2a_dir:
             try:
                 gpaths = _s2cpa.write_grok2api_auth_bundle(
@@ -1417,16 +1646,22 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, result_out=None) -> b
                 grok2api_auth_path_value = str(gpath)
                 auth_path_value = auth_path_value or str(gpath)
                 auth_entries.extend(f"Grok2API {kind}: {path}" for kind, path in gpaths.items())
-                if g2a_remote_configured and g2a_auto_import:
+                if g2a_remote_configured and g2a_import_formats:
                     _cpa_log(
                         "Grok2API 远程导入网络: 直连 -> "
-                        f"{str(config.get('grok2api_remote_url') or '').rstrip('/')}"
+                        f"{str(config.get('grok2api_remote_url') or '').rstrip('/')} "
+                        f"formats={','.join(g2a_import_formats)}"
                     )
                     remote_results = {}
                     remote_errors = {}
                     try:
                         with _grok2api.Grok2APIClient.from_config(config) as client:
-                            for format_name, format_path in gpaths.items():
+                            for format_name in g2a_import_formats:
+                                format_path = gpaths.get(format_name)
+                                if not format_path:
+                                    remote_errors[format_name] = "授权 JSON 不存在"
+                                    _cpa_log(f"Grok2API 远程导入跳过 [{format_name}]: 授权 JSON 不存在")
+                                    continue
                                 try:
                                     remote_result = client.import_auth_file(
                                         format_path, format_name=format_name
@@ -1472,10 +1707,81 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, result_out=None) -> b
                         },
                     )
                 elif g2a_remote_configured:
+                    if g2a_auto_import and not g2a_import_formats:
+                        _cpa_log("已开启 Grok2API 自动导入，但未勾选 Build / Web / Console")
                     _set_result(grok2api_remote_status="ready")
             except Exception as g2a_exc:
                 _cpa_log(f"Grok2API 写入失败: {g2a_exc}")
                 auth_errors.append(f"Grok2API 失败: {g2a_exc}")
+
+        # Sub2API 分支：与 CPA/Grok2API 并列，独立 try/except，不参与 wrote_ok
+        # 服务端自行 SSO→OAuth，这里只传原始 SSO 字符串
+        if sub2api_enabled and sub2api_configured:
+            try:
+                name_prefix = str(config.get("sub2api_name_prefix", "") or "").strip()
+                group_ids = _sub2api.Sub2APIClient.parse_group_ids(
+                    config.get("sub2api_group_ids", "")
+                )
+                _cpa_log(
+                    "[Sub2API] 远程上传网络: 直连 -> "
+                    f"{str(config.get('sub2api_remote_url') or '').rstrip('/')}"
+                )
+                with _sub2api.Sub2APIClient.from_config(config) as sub2_client:
+                    remote_result = sub2_client.sso_to_oauth(
+                        [sso],
+                        name=name_prefix,
+                        proxy_id=config.get("sub2api_proxy_id", 0),
+                        group_ids=group_ids,
+                        concurrency=config.get("sub2api_concurrency", 1),
+                        priority=config.get("sub2api_priority", 0),
+                    )
+                created = remote_result.get("created") or []
+                failed = remote_result.get("failed") or []
+                created_n = len(created) if isinstance(created, list) else int(bool(created))
+                failed_n = len(failed) if isinstance(failed, list) else int(bool(failed))
+                if failed_n and created_n:
+                    remote_status = "partial"
+                elif failed_n and not created_n:
+                    remote_status = "failed"
+                else:
+                    remote_status = "success"
+                error_text = ""
+                if failed_n:
+                    error_text = f"failed={failed_n}"
+                    if isinstance(failed, list) and failed:
+                        error_text = f"{error_text}: {failed[:3]}"
+                _set_result(
+                    sub2api_remote_status=remote_status,
+                    sub2api_remote_imported_at=RegistrationRepository.now_text(),
+                    sub2api_remote_error=error_text,
+                    sub2api_remote_result={
+                        "created_count": created_n,
+                        "failed_count": failed_n,
+                        "created": created if isinstance(created, list) else created,
+                        "failed": failed if isinstance(failed, list) else failed,
+                    },
+                )
+                if remote_status == "success":
+                    _cpa_log(f"[Sub2API] 已上传 (created={created_n})")
+                else:
+                    _cpa_log(
+                        f"[Sub2API] 上传结果 {remote_status} "
+                        f"(created={created_n}, failed={failed_n})"
+                    )
+            except Exception as sub2_exc:
+                # 不写入 auth_errors，避免影响 CPA 成功判定
+                _cpa_log(f"[Sub2API] 上传失败: {sub2_exc}")
+                _set_result(
+                    sub2api_remote_status="failed",
+                    sub2api_remote_error=str(sub2_exc),
+                    sub2api_remote_result=None,
+                )
+        elif sub2api_enabled and not sub2api_configured:
+            _cpa_log("[Sub2API] 已开启但未配齐 remote_url / api_key，跳过上传")
+            _set_result(sub2api_remote_status="not_configured")
+        else:
+            _set_result(sub2api_remote_status="disabled")
+
         if not wrote_ok:
             error_text = "; ".join(auth_errors) or "CPA/Grok2API 均未写入成功"
             _set_result(
@@ -2431,6 +2737,10 @@ def is_browser_headless():
     return bool(config.get("browser_headless", False))
 
 
+def get_browser_engine() -> str:
+    return _bs.normalize_browser_engine(config.get("browser_engine", "camoufox"))
+
+
 def get_browser_locale() -> str:
     value = str(config.get("browser_locale", "en-US") or "en-US").strip()
     return value if value in {"en-US", "zh-CN"} else "en-US"
@@ -2480,6 +2790,7 @@ def _wire_runtime_modules():
         is_debug=is_debug_mode,
         is_headless=is_browser_headless,
         get_locale=get_browser_locale,
+        get_engine=get_browser_engine,
         extension_path=EXTENSION_PATH,
     )
     _rf.configure(
@@ -2535,6 +2846,20 @@ def run_registration(count):
     _token_mode_map = {"device_protocol": "协议 Device Flow", "device_browser": "浏览器 Device Flow", "auth_code": "Authorization Code"}
     _token_mode_label = _token_mode_map.get(str(config.get("cpa_token_mode", "device_protocol")), "协议 Device Flow")
     registration_log(f"[*] SSO→auth: {'开' if config.get('cpa_auto_add') else '关（账号将不计成功）'}" + (f"（{_token_mode_label}）" if config.get('cpa_auto_add') else ""))
+    # TokenAuth 各下游上传开关摘要，便于开跑时一眼确认
+    _cpa_up = "开" if config.get("cpa_upload_enabled", True) else "关"
+    _g2a_formats = _grok2api.Grok2APIClient.auto_import_formats(config)
+    if _g2a_formats:
+        _g2a_labels = {
+            "grok_build": "build",
+            "grok_web": "web",
+            "grok_console": "console",
+        }
+        _g2a_up = "开(" + "/".join(_g2a_labels[name] for name in _g2a_formats) + ")"
+    else:
+        _g2a_up = "关"
+    _s2a_up = "开" if config.get("sub2api_enabled", False) else "关"
+    registration_log(f"[*] [TokenAuth] CPA上传={_cpa_up} Grok2API导入={_g2a_up} Sub2API={_s2a_up}")
     traceback_log_lock = threading.Lock()
     logged_traceback_signatures = set()
     # 启动前清理上次崩溃 / 强杀残留的临时 profile 目录
@@ -2675,6 +3000,7 @@ def run_registration(count):
                             sso,
                             email=email,
                             log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
+                            result_out=cpa_detail,
                         )
                         if config.get("enable_nsfw", True):
                             nsfw_ok, nsfw_msg = enable_nsfw_for_token(
@@ -2843,30 +3169,12 @@ def run_registration(count):
                                     f" botFlagSource={getattr(exc, 'bot_flag_source', None)!r}"
                                 )
                         fail_email = current_attempt_email(email, exc)
-                        email_disable_detail = None
-                        if kind == FAIL_ALREADY_REGISTERED and is_outlookemail_registration() and fail_email:
-                            registration_log(
-                                f"[W{wid+1}] [*] 账号已注册，按自动停用开关处理 Outlook 邮箱: {fail_email}"
-                            )
-                            email_disable_detail = disable_outlookemail_consumed(
-                                fail_email,
-                                reason=f"账号已注册: {exc}",
-                                log_callback=lambda m: registration_log(f"[W{wid+1}] {m}")
-                            )
-                            status = str((email_disable_detail or {}).get("status") or "")
-                            if status == "success":
-                                registration_log(
-                                    f"[W{wid+1}] [+] 账号已注册：Outlook 邮箱停用完成: {fail_email}"
-                                )
-                            elif status == "feature_disabled":
-                                registration_log(
-                                    f"[W{wid+1}] [*] 账号已注册：自动停用开关未开启，跳过停用 Outlook: {fail_email}"
-                                )
-                            elif status == "failed":
-                                registration_log(
-                                    f"[W{wid+1}] [!] 账号已注册：Outlook 邮箱停用失败: {fail_email}"
-                                    f" — {(email_disable_detail or {}).get('error') or ''}"
-                                )
+                        email_disable_detail = maybe_disable_outlookemail_for_consumed_failure(
+                            kind,
+                            fail_email,
+                            reason=f"{FAIL_LABELS.get(kind, kind)}: {exc}",
+                            log_callback=lambda m: registration_log(f"[W{wid+1}] {m}"),
+                        )
                         _persist_result(
                             started_at=attempt_started_at,
                             worker_id=wid,
@@ -3023,7 +3331,12 @@ def run_registration(count):
                 sso = wait_for_sso_cookie(
                     log_callback=registration_log, cancel_callback=controller.should_stop
                 )
-                ensure_sso_oauth_eligible(sso, email=email, log_callback=registration_log)
+                ensure_sso_oauth_eligible(
+                    sso,
+                    email=email,
+                    log_callback=registration_log,
+                    result_out=cpa_detail,
+                )
                 if config.get("enable_nsfw", True):
                     registration_log("[*] 6. 开启 NSFW")
                     nsfw_ok, nsfw_msg = enable_nsfw_for_token(
@@ -3191,30 +3504,12 @@ def run_registration(count):
                             f" botFlagSource={getattr(exc, 'bot_flag_source', None)!r}"
                         )
                 fail_email = current_attempt_email(email, exc)
-                email_disable_detail = None
-                if kind == FAIL_ALREADY_REGISTERED and is_outlookemail_registration() and fail_email:
-                    registration_log(
-                        f"[*] 账号已注册，按自动停用开关处理 Outlook 邮箱: {fail_email}"
-                    )
-                    email_disable_detail = disable_outlookemail_consumed(
-                        fail_email,
-                        reason=f"账号已注册: {exc}",
-                        log_callback=registration_log
-                    )
-                    status = str((email_disable_detail or {}).get("status") or "")
-                    if status == "success":
-                        registration_log(
-                            f"[+] 账号已注册：Outlook 邮箱停用完成: {fail_email}"
-                        )
-                    elif status == "feature_disabled":
-                        registration_log(
-                            f"[*] 账号已注册：自动停用开关未开启，跳过停用 Outlook: {fail_email}"
-                        )
-                    elif status == "failed":
-                        registration_log(
-                            f"[!] 账号已注册：Outlook 邮箱停用失败: {fail_email}"
-                            f" — {(email_disable_detail or {}).get('error') or ''}"
-                        )
+                email_disable_detail = maybe_disable_outlookemail_for_consumed_failure(
+                    kind,
+                    fail_email,
+                    reason=f"{FAIL_LABELS.get(kind, kind)}: {exc}",
+                    log_callback=registration_log,
+                )
                 _persist_result(
                     started_at=attempt_started_at,
                     email=fail_email,

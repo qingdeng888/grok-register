@@ -1,4 +1,4 @@
-"""注册风控拒绝（registration_risk）要和 access_token bfs=1 一样标记 bot_risk。
+"""注册风控拒绝要和 access_token bfs 非 0 一样标记 bot_risk。
 
 botFlagSource 与 access_token 里的 bfs 声明是同一个字段，只是一个来自注册后的
 账号状态页、一个来自换到的 token。之前 FAIL_RISK 只写了 cpa_status=rejected，
@@ -43,17 +43,6 @@ class RegistrationRiskBotFlagTests(unittest.TestCase):
         self.assertTrue(detail["bot_risk"])
         self.assertEqual(detail["bfs"], 1)
 
-    def test_apply_marks_policy_deny_with_zero_source(self):
-        # 服务端 policy=deny 裁决拒绝时 botFlagSource 可能解析成 0/null，
-        # 那依然是风控标记，不能因为 source 为 0 就漏标。
-        exc = engine.RegistrationRiskDenied(
-            "注册风控拒绝", bot_risk=True, bot_flag_source=0
-        )
-        detail = {}
-        self.assertTrue(engine.apply_risk_bot_flag(detail, exc))
-        self.assertTrue(detail["bot_risk"])
-        self.assertEqual(detail["bfs"], 0)
-
     def test_apply_handles_none_source(self):
         exc = engine.RegistrationRiskDenied(
             "注册风控拒绝", bot_risk=True, bot_flag_source=None
@@ -82,7 +71,13 @@ class RegistrationRiskBotFlagTests(unittest.TestCase):
             "error": "",
         }
         original = dict(engine.config)
-        engine.config.update({"cpa_auto_add": True, "cpa_auth_dir": "data/cpa_auth"})
+        engine.config.update(
+            {
+                "cpa_auto_add": True,
+                "cpa_auth_dir": "data/cpa_auth",
+                "sso_detailed_risk_check": False,
+            }
+        )
         try:
             with (
                 mock.patch.object(

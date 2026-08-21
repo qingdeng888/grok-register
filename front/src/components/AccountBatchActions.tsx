@@ -1,4 +1,4 @@
-import { Archive, ChevronDown, ListChecks, Loader2, LogIn, Trash2 } from "lucide-react";
+import { Archive, ChevronDown, ListChecks, Loader2, LogIn, ShieldCheck, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui";
 
 export function AccountBatchActions({
@@ -6,25 +6,32 @@ export function AccountBatchActions({
   busy,
   menuOpen,
   reloginRunning,
+  ssoCheckRunning,
+  taskConflict,
   onToggleMenu,
   onCloseMenu,
   onExport,
   onRelogin,
+  onSsoCheck,
   onDelete,
 }: {
   selectedCount: number;
   busy: boolean;
   menuOpen: boolean;
   reloginRunning: boolean;
+  ssoCheckRunning: boolean;
+  taskConflict: boolean;
   onToggleMenu: () => void;
   onCloseMenu: () => void;
   onExport: (kind: "cpa" | "grok2api") => void;
   onRelogin: () => void;
+  onSsoCheck: () => void;
   onDelete: () => void;
 }) {
   return (
     <div className="relative">
       <Button
+        size="sm"
         variant="outline"
         className="w-full"
         onClick={onToggleMenu}
@@ -55,6 +62,16 @@ export function AccountBatchActions({
             <button
               type="button"
               role="menuitem"
+              className="flex min-h-10 w-full items-center gap-2 rounded-lg px-3 text-left text-sm font-medium hover:bg-muted disabled:cursor-not-allowed disabled:opacity-45"
+              disabled={taskConflict || ssoCheckRunning || reloginRunning}
+              onClick={onSsoCheck}
+            >
+              <ShieldCheck className="h-4 w-4" aria-hidden="true" />
+              SSO 详细风控检查
+            </button>
+            <button
+              type="button"
+              role="menuitem"
               className="flex min-h-10 w-full items-center gap-2 rounded-lg px-3 text-left text-sm font-medium hover:bg-muted"
               onClick={() => onExport("cpa")}
             >
@@ -74,7 +91,7 @@ export function AccountBatchActions({
               type="button"
               role="menuitem"
               className="flex min-h-10 w-full items-center gap-2 rounded-lg px-3 text-left text-sm font-medium hover:bg-muted disabled:cursor-not-allowed disabled:opacity-45"
-              disabled={reloginRunning}
+              disabled={taskConflict || reloginRunning || ssoCheckRunning}
               onClick={onRelogin}
             >
               <LogIn className="h-4 w-4" aria-hidden="true" />

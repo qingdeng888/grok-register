@@ -4,7 +4,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from backend.web.application import _config_file_snapshot
+from fastapi import HTTPException
+
+from backend.registration import engine as gr
+from backend.web.application import _apply_config_updates, _config_file_snapshot
 
 
 class ConfigFileSnapshotTests(unittest.TestCase):
@@ -19,6 +22,7 @@ class ConfigFileSnapshotTests(unittest.TestCase):
             self.assertEqual(json.loads(snapshot["content"])["secret"], "value")
             self.assertGreater(snapshot["size"], 0)
             self.assertFalse(snapshot["parse_error"])
+            self.assertIn("proxy", snapshot["sensitive_keys"])
 
     def test_reports_invalid_json_without_hiding_file_content(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -28,6 +32,51 @@ class ConfigFileSnapshotTests(unittest.TestCase):
                 snapshot = _config_file_snapshot()
             self.assertTrue(snapshot["parse_error"])
             self.assertIn('{"broken":', snapshot["content"])
+
+
+class ProxyConfigUpdateTests(unittest.TestCase):
+    def setUp(self):
+        self.original_config = dict(gr.config)
+
+    def tearDown(self):
+        gr.config.clear()
+        gr.config.update(self.original_config)
+
+    def test_encoded_authenticated_http_proxy_is_saved_unchanged(self):
+        proxy = "http://user%40mail:p%40ss@proxy.example.com:8080"
+        with patch.object(gr, "load_config"), patch.object(gr, "save_config") as save:
+            result = _apply_config_updates({"proxy": f"  {proxy}  "})
+
+        self.assertEqual(gr.config["proxy"], proxy)
+        self.assertEqual(result["config"]["proxy"], proxy)
+        save.assert_called_once_with()
+
+    def test_invalid_http_proxy_is_rejected_before_saving(self):
+        with patch.object(gr, "load_config"), patch.object(gr, "save_config") as save:
+            with self.assertRaises(HTTPException) as raised:
+                _apply_config_updates(
+                    {"proxy": "http://user:bad%ZZ@proxy.example.com:8080"}
+                )
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertIn("网络代理格式错误", str(raised.exception.detail))
+        save.assert_not_called()
+
+    def test_sso_detailed_risk_switch_is_public_and_saved_as_boolean(self):
+        with patch.object(gr, "load_config"), patch.object(gr, "save_config") as save:
+            result = _apply_config_updates({"sso_detailed_risk_check": True})
+
+        self.assertIs(gr.config["sso_detailed_risk_check"], True)
+        self.assertIs(result["config"]["sso_detailed_risk_check"], True)
+        save.assert_called_once_with()
+
+    def test_browser_engine_accepts_cloakbrowser_and_falls_back_to_camoufox(self):
+        with patch.object(gr, "load_config"), patch.object(gr, "save_config"):
+            selected = _apply_config_updates({"browser_engine": "cloakbrowser"})
+            fallback = _apply_config_updates({"browser_engine": "unknown"})
+
+        self.assertEqual(selected["config"]["browser_engine"], "cloakbrowser")
+        self.assertEqual(fallback["config"]["browser_engine"], "camoufox")
 
 
 if __name__ == "__main__":

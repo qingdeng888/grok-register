@@ -1,6 +1,6 @@
 # Grok Register
 
-基于 FastAPI、React 和 Camoufox 的 Web 注册管理工具。支持注册任务、账号管理，以及 CPA / Grok2API 授权文件生成。
+基于 FastAPI、React 和 Playwright 浏览器适配层的 Web 注册管理工具。Camoufox 保持默认，同时可切换到 CloakBrowser，支持注册任务、账号管理，以及 CPA / Grok2API 授权文件生成。
 
 [部署文档](DEPLOYMENT.md) · [Web 说明](WEB.md)
 
@@ -19,9 +19,10 @@
 ## 功能
 
 - Web 控制台：任务进度、实时日志、账号管理和系统设置
-- Camoufox 浏览器，支持多 worker 和异常进程清理
+- Camoufox（Firefox，默认）与 CloakBrowser（Chromium）双浏览器后端，共用注册流程、代理和异常进程清理
 - 支持 Cloudflare、DuckMail / Mail.tm、YYDS、MailNest、OutlookEmail、CloudMail、Inbucket（自建）
 - 注册完成后生成 CPA / Grok2API JSON
+- Grok Build 导入成功后可通过持久 Webhook 通知 GrokIQ
 - JSON 查看、复制和下载
 - 首次访问创建唯一管理员账号
 - Docker Compose 部署，支持无桌面 Linux 服务器
@@ -51,7 +52,7 @@ docker compose logs -f grok-register
 curl http://127.0.0.1:8787/api/health
 ```
 
-容器内使用 **Xvfb + 有头 Camoufox**，服务器不需要桌面环境。Docker 模式会强制关闭无头模式。
+容器内使用 **Xvfb + 有头浏览器**，服务器不需要桌面环境。默认后端仍是 Camoufox，可在设置页切换 CloakBrowser；Docker 模式会强制关闭无头模式。
 
 如果配置里的代理是 `127.0.0.1:7897`，Compose 会自动映射到宿主机代理。宿主机代理软件需要允许局域网连接（监听 `0.0.0.0` 或 Docker 网桥地址）。
 
@@ -81,6 +82,55 @@ http://outlook-email:5000
 Docker 首次生成 `data/config.json` 时会预填该内部地址；已有配置可在“系统设置 → Outlook 邮箱池”中填写。
 
 OutlookEmail 数据保存在 `outlookemail-data/`，并已被 Git 和 Docker 构建上下文忽略。完整配置见 [DEPLOYMENT.md](DEPLOYMENT.md#可选-outlookemail-邮箱池)。
+
+## 与 GrokIQ 联动
+
+本项目可与 [GrokIQ](https://github.com/kaibush/grok-iq) 统一编排。Grok Register 将账号成功导入 Grok2API 后，会通过持久 Webhook 通知 GrokIQ；GrokIQ 接收并去重账号事件，还可按设置自动执行首次质量探针。
+
+```text
+Grok Register 注册并导入 Grok2API
+              │
+              └─ 持久 Webhook / 失败退避重试
+                         │
+                         ▼
+              GrokIQ
+              接收账号 → 自动探针 → 风险与质量监控
+```
+
+复制环境变量模板，并至少为两端设置相同的联动 Token：
+
+```bash
+cp .env.example .env
+
+# 编辑 .env
+GROKIQ_WEBHOOK_TOKEN=替换为随机长字符串
+```
+
+随后使用两个 Compose 文件启动注册机、GrokIQ 后端和 GrokIQ 前端：
+
+```bash
+docker compose -f compose.yaml -f compose.grokiq.yaml pull
+docker compose -f compose.yaml -f compose.grokiq.yaml up -d
+```
+
+默认访问地址：
+
+```text
+Grok Register: http://服务器IP:8787
+GrokIQ:        http://服务器IP:8091
+```
+
+GrokIQ 前端通过容器内 Nginx 将 `/api` 请求转发至 `grokiq-backend:8090`，因此 GrokIQ 后端端口无需暴露到宿主机。`8091` 默认监听所有网卡；使用反向代理时可在 `.env` 设置 `GROKIQ_WEB_BIND=127.0.0.1`。
+
+验证联动服务：
+
+```bash
+docker compose -f compose.yaml -f compose.grokiq.yaml ps
+curl http://127.0.0.1:8091/api/health
+docker compose -f compose.yaml -f compose.grokiq.yaml logs -f grokiq-backend grokiq-frontend
+```
+
+首次启动后，在 GrokIQ 的“系统设置 → 联动与启动项”中保存联动 Token、首次探针方案和出口目标；再到 Grok Register 的“系统设置 → Grok2API”中启用 GrokIQ 联动并填写相同 Token。完整说明见 [DEPLOYMENT.md](DEPLOYMENT.md#与-grokiq-统一编排)。
 
 ## 配置文件
 
@@ -125,7 +175,10 @@ Docker 配置中的授权目录建议保持：
   "grok2api_remote_url": "https://grok2api.example.com",
   "grok2api_remote_username": "admin",
   "grok2api_remote_password": "change-me",
-  "grok2api_auto_import": true
+  "grok2api_auto_import": true,
+  "grok2api_auto_import_build": true,
+  "grok2api_auto_import_web": false,
+  "grok2api_auto_import_console": false
 }
 ```
 
@@ -167,9 +220,11 @@ Windows 启动：
 | `inbucket_domain` | Inbucket 收信域名，支持 `*` 通配符随机子域，如 `*.mail.example.com` |
 | `register_count` | 注册数量 |
 | `register_workers` | 并发数量，默认 1 |
-| `proxy` | 注册和 OAuth 请求使用的代理。支持 `http://` 与带认证的 `socks5://user:pass@ip:port`；socks5 由本地 HTTP 代理桥转发，仅注册走代理，邮箱验证码始终直连 |
+| `proxy` | 注册和 OAuth 请求使用的代理。支持 `http://host:port`、`http://user:password@host:port`（凭据特殊字符需 URL 百分号编码）以及本地定制的 `socks5://user:pass@ip:port`（socks5 由本地 Socks5Bridge 桥接）；仅注册走代理，邮箱验证码始终直连 |
+| `browser_engine` | 浏览器后端：`camoufox`（默认）或 `cloakbrowser` |
 | `browser_headless` | 本机无头模式；Docker 中强制关闭 |
 | `cpa_auto_add` | 注册后生成 CPA 授权 |
+| `sso_detailed_risk_check` | 获取 SSO 后详细检查账号页；`botFlagSource=0` 正常，非 `0` 异常，缺失时自动重试 |
 | `cpa_auth_dir` | CPA JSON 保存目录 |
 | `cpa_remote_url` | CPA Management API 地址 |
 | `cpa_management_key` | CPA 管理密钥 |
@@ -178,6 +233,15 @@ Windows 启动：
 | `grok2api_remote_username` | 远程 Grok2API 管理员账号 |
 | `grok2api_remote_password` | 远程 Grok2API 管理员密码 |
 | `grok2api_auto_import` | JSON 生成后自动登录并导入远程 Grok2API |
+| `grok2api_auto_import_build` | 自动导入 grok_build，默认开启 |
+| `grok2api_auto_import_web` | 自动导入 grok_web，默认关闭 |
+| `grok2api_auto_import_console` | 自动导入 grok_console，默认关闭 |
+| `grokiq_webhook_enabled` | 导入 Grok Build 后发送账号已导入 Webhook |
+| `grokiq_webhook_url` | GrokIQ `account-imported` 接口地址 |
+| `grokiq_webhook_token` | Webhook 请求头 `x-grokiq-token` |
+| `grokiq_webhook_timeout_seconds` | 单次投递超时；失败后由持久 Outbox 退避重试 |
+
+统一 Compose 中，`GROKIQ_REGISTER_PROBE_STABILIZATION_SECONDS` 控制 GrokIQ 收到新账号事件后等待多久再创建首次探针，默认 `15` 秒，设为 `0` 可关闭等待。
 
 配置模板见 [`config.example.json`](config.example.json)。
 
@@ -189,7 +253,8 @@ data/
 ├── web_auth.json                 # Web 管理员认证
 ├── accounts/                     # 账号和注册结果
 ├── cpa_auth/                     # CPA JSON
-└── grok2api_auth/                # Grok2API JSON
+├── grok2api_auth/                # Grok2API JSON
+└── cloakbrowser-cache/           # CloakBrowser 首次使用后下载的 Chromium
 
 logs/                             # 运行日志
 outlookemail-data/                # 可选 OutlookEmail 数据
@@ -210,12 +275,36 @@ docker compose up -d --build
 # 验证有头 Camoufox
 docker compose run --rm grok-register python /app/docker/camoufox_smoke.py
 
+# 验证有头 CloakBrowser（首次运行会下载并缓存 Chromium）
+docker compose run --rm grok-register python /app/docker/cloakbrowser_smoke.py
+
 # 后端测试
 .venv/bin/python -m unittest discover -s backend/tests -v
 
 # 前端构建
 cd front && npm run build
 ```
+
+## 新版本检测
+
+服务启动后会读取根目录 `VERSION`，立即查询一次 GitHub Releases，之后每
+1 小时复查。发现高于当前版本的正式 Release 时，管理控制台会自动弹出更新提示，
+展示版本号、更新说明和 Release 链接；关闭后同一版本不再重复弹出，更高版本
+发布后会重新提示。
+
+无需发布测试版本也可以预览弹窗：登录管理控制台后访问
+`/overview?preview-update=1`。预览关闭状态不会写入正式版本的忽略记录，刷新页面
+可以再次查看。
+
+Docker 镜像更新仍使用：
+
+```bash
+docker compose pull
+docker compose up -d --force-recreate
+```
+
+推送 `vX.Y.Z` 标签后，GitHub Actions 会构建对应多架构镜像并自动创建 GitHub
+Release；标签版本同时注入镜像内的 `VERSION`。
 
 ## 常见问题
 
@@ -232,6 +321,14 @@ docker compose restart grok-register
 ```bash
 .venv/bin/python -m camoufox fetch
 .venv/bin/python -m camoufox version
+```
+
+### CloakBrowser 首次启动
+
+安装依赖后可预先下载 Chromium；Docker 会把缓存保存在 `data/cloakbrowser-cache/`：
+
+```bash
+.venv/bin/python -m cloakbrowser install
 ```
 
 ### 公网 HTTPS 登录状态异常
@@ -259,7 +356,7 @@ front/                  React 前端
 backend/                Python 后端
   web/                  FastAPI、认证与任务调度
   registration/         注册编排、仓储和结果产物
-  automation/           Camoufox 浏览器运行时
+  automation/           Camoufox / CloakBrowser 浏览器运行时与共用页面适配
   integrations/         代理、连通性和授权交换
   mailbox/              邮箱渠道适配
   shared/               公共路径等基础设施
@@ -272,7 +369,18 @@ data/                   运行数据
 logs/                   运行日志
 outlookemail-data/      可选 OutlookEmail 数据
 compose.yaml            Docker Compose 配置
+compose.grokiq.yaml     GrokIQ 联动编排
 ```
+
+## Stars 趋势
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/stars-trend-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="docs/images/stars-trend-light.svg">
+  <img alt="Grok Register Stars 趋势" src="docs/images/stars-trend-light.svg">
+</picture>
+
+> 图表由 GitHub Actions 每 6 小时读取最新 Stars 总数并自动更新，浅色与深色主题会随 GitHub 页面设置切换。
 
 ## 友情链接
 

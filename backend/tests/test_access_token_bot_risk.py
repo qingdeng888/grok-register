@@ -1,4 +1,4 @@
-"""access_token JWT bfs=1 风控标记。"""
+"""access_token JWT bfs=0 正常，非零值为风控标记。"""
 
 import base64
 import json
@@ -22,7 +22,7 @@ def fake_jwt(payload: dict) -> str:
 
 
 class AccessTokenBotRiskTests(unittest.TestCase):
-    def test_decode_helpers_detect_bfs_one(self):
+    def test_decode_helpers_treat_every_nonzero_bfs_as_risk(self):
         token = fake_jwt({"sub": "user", "bfs": 1})
         self.assertEqual(auth_exchange.access_token_bfs(token), 1)
         self.assertTrue(auth_exchange.access_token_bot_risk(token))
@@ -33,6 +33,14 @@ class AccessTokenBotRiskTests(unittest.TestCase):
 
         string_flag = fake_jwt({"bfs": "1"})
         self.assertTrue(auth_exchange.access_token_bot_risk(string_flag))
+
+        for value in (2, 3, -1, "2", "-1"):
+            with self.subTest(value=value):
+                self.assertTrue(auth_exchange.access_token_bot_risk(fake_jwt({"bfs": value})))
+
+        for value in (0, "0"):
+            with self.subTest(value=value):
+                self.assertFalse(auth_exchange.access_token_bot_risk(fake_jwt({"bfs": value})))
 
     def test_add_sso_to_cpa_stores_bot_risk_on_result(self):
         original = dict(engine.config)
@@ -116,6 +124,51 @@ class AccessTokenBotRiskTests(unittest.TestCase):
             self.assertTrue(item["bot_risk"])
             self.assertEqual(item["bfs"], "1")
 
+    def test_serialize_exposes_detailed_sso_risk_result(self):
+        record = {
+            "id": 1,
+            "extra_json": json.dumps(
+                {
+                    "sso_risk_check": {
+                        "verdict": "clean",
+                        "bot_flag_source": 0,
+                        "valid_session": True,
+                    }
+                }
+            ),
+        }
+        with mock.patch.object(webapp, "_gr") as gr_mock:
+            gr_mock.return_value.config = {}
+            with (
+                mock.patch.object(webapp, "_find_account_auth_file", side_effect=FileNotFoundError),
+                mock.patch.object(webapp, "_find_account_sso_file", side_effect=FileNotFoundError),
+                mock.patch(
+                    "backend.integrations.grok2api_client.Grok2APIClient.is_configured",
+                    return_value=False,
+                ),
+            ):
+                item = webapp._serialize_record(record)
+
+        self.assertEqual(item["sso_risk_check"]["bot_flag_source"], 0)
+        self.assertEqual(item["sso_risk_check"]["verdict"], "clean")
+
+    def test_serialize_treats_any_nonzero_bfs_as_risk(self):
+        record = {"id": 1, "bot_risk": 0, "bfs": "4", "extra_json": "{}"}
+        with mock.patch.object(webapp, "_gr") as gr_mock:
+            gr_mock.return_value.config = {}
+            with (
+                mock.patch.object(webapp, "_find_account_auth_file", side_effect=FileNotFoundError),
+                mock.patch.object(webapp, "_find_account_sso_file", side_effect=FileNotFoundError),
+                mock.patch(
+                    "backend.integrations.grok2api_client.Grok2APIClient.is_configured",
+                    return_value=False,
+                ),
+            ):
+                item = webapp._serialize_record(record)
+
+        self.assertTrue(item["bot_risk"])
+        self.assertEqual(item["bfs"], "4")
+
     def test_migration_adds_bot_risk_columns(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "results.sqlite3"
@@ -167,7 +220,7 @@ class AccessTokenBotRiskTests(unittest.TestCase):
             with closing(sqlite3.connect(path)) as conn:
                 columns = {row[1] for row in conn.execute("PRAGMA table_info(registration_results)")}
                 version = conn.execute("PRAGMA user_version").fetchone()[0]
-            self.assertEqual(version, 6)
+            self.assertEqual(version, 7)
             self.assertIn("bot_risk", columns)
             self.assertIn("bfs", columns)
             self.assertEqual(store.list_results()[0]["bot_risk"], 0)
