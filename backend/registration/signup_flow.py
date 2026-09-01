@@ -417,19 +417,28 @@ return candidates[0].text || true;
     raise Exception("未找到「使用邮箱注册」按钮")
 
 
+def _prepare_exit_ip(log_callback=None):
+    prepare = _deps.get("prepare_exit_ip")
+    if callable(prepare):
+        prepare(log_callback)
+
+
 def open_signup_page(log_callback=None, cancel_callback=None):
     raise_if_cancelled(cancel_callback)
-    if active_browser() is None:
-        start_browser(log_callback=log_callback)
-        if log_callback:
-            log_callback("[*] 浏览器已启动")
+
+    def _ensure_browser():
+        if active_browser() is None:
+            start_browser(log_callback=log_callback, cancel_callback=cancel_callback)
+            if log_callback:
+                log_callback("[*] 浏览器已启动")
+        _prepare_exit_ip(log_callback)
 
     def _navigate_signup():
         # 优先复用已有标签，避免反复 new_tab 堆积空窗口
+        _ensure_browser()
         browser_obj = active_browser()
         if browser_obj is None:
-            start_browser(log_callback=log_callback)
-            browser_obj = active_browser()
+            raise Exception("浏览器启动失败")
         try:
             tabs = browser_obj.get_tabs() if browser_obj is not None else []
             page_obj = tabs[-1] if tabs else browser_obj.new_tab()
@@ -449,7 +458,7 @@ def open_signup_page(log_callback=None, cancel_callback=None):
         if log_callback:
             log_callback(f"[Debug] 打开URL异常: {e}")
         try:
-            restart_browser(log_callback=log_callback)
+            restart_browser(log_callback=log_callback, cancel_callback=cancel_callback)
             _navigate_signup()
         except Exception as e2:
             # 导航彻底失败：关掉残留实例，避免空浏览器挂着

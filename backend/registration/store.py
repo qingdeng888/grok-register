@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import datetime as _datetime
+import ipaddress
 import json
 import os
 import sqlite3
@@ -260,7 +261,26 @@ class RegistrationRepository:
                 """,
                 (self.now_text(),),
             )
-            conn.execute("PRAGMA user_version = 7")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS flagged_exit_ips (
+                    ip TEXT PRIMARY KEY,
+                    first_seen_at TEXT NOT NULL DEFAULT '',
+                    last_seen_at TEXT NOT NULL DEFAULT '',
+                    hit_count INTEGER NOT NULL DEFAULT 1,
+                    last_email TEXT NOT NULL DEFAULT '',
+                    last_bot_flag_source TEXT NOT NULL DEFAULT '',
+                    last_failure_reason TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_flagged_exit_ips_last_seen
+                    ON flagged_exit_ips(last_seen_at)
+                """
+            )
+            conn.execute("PRAGMA user_version = 8")
 
     def add_result(self, record: Dict[str, Any]) -> int:
         now = self.now_text()
@@ -589,23 +609,32 @@ class RegistrationRepository:
             clauses.append("batch_id = ?")
             params.append(normalized_batch_id)
         normalized_bot_risk = str(bot_risk or "").strip().lower()
+        extra_json_sql = (
+            "CASE WHEN json_valid(extra_json) THEN extra_json ELSE '{}' END"
+        )
+        grokiq_degraded_sql = (
+            f"COALESCE(json_extract({extra_json_sql}, '$.grokiq_result.degraded') "
+            "IN (1, '1', 'true', 'True'), 0) = 1"
+        )
         if normalized_bot_risk in {"1", "true", "yes", "risk", "bot", "bot_risk"}:
             clauses.append(
                 "(COALESCE(bot_risk, 0) = 1 OR "
-                "(trim(COALESCE(bfs, '')) <> '' AND trim(COALESCE(bfs, '')) <> '0'))"
+                "(trim(COALESCE(bfs, '')) <> '' AND trim(COALESCE(bfs, '')) <> '0') OR "
+                f"{grokiq_degraded_sql})"
             )
         elif normalized_bot_risk in {"0", "false", "no", "normal", "safe"}:
             clauses.append(
-                "COALESCE(bot_risk, 0) = 0 AND ("
+                "COALESCE(bot_risk, 0) = 0 AND "
+                f"NOT ({grokiq_degraded_sql}) AND ("
                 "trim(COALESCE(bfs, '')) = '0' OR "
-                "(trim(COALESCE(bfs, '')) = '' AND "
-                "json_extract(CASE WHEN json_valid(extra_json) THEN extra_json ELSE '{}' END, "
-                "'$.sso_check_status') = 'clean'))"
+                f"(trim(COALESCE(bfs, '')) = '' AND "
+                f"json_extract({extra_json_sql}, '$.sso_check_status') = 'clean'))"
             )
         elif normalized_bot_risk in {"unknown", "unchecked", "pending"}:
             clauses.append(
                 "COALESCE(bot_risk, 0) = 0 AND trim(COALESCE(bfs, '')) = '' AND "
-                "COALESCE(json_extract(CASE WHEN json_valid(extra_json) THEN extra_json ELSE '{}' END, "
+                f"NOT ({grokiq_degraded_sql}) AND "
+                f"COALESCE(json_extract({extra_json_sql}, "
                 "'$.sso_check_status'), '') <> 'clean'"
             )
         normalized_keyword = str(keyword or "").strip()
@@ -993,6 +1022,162 @@ class RegistrationRepository:
             )
             return bool(cursor.rowcount)
 
+    def save_grokiq_result(self, payload: Dict[str, Any]) -> Dict[str, Any] | None:
+        """Persist a GrokIQ notify callback onto the matching record."""
+
+        data = dict(payload or {})
+        registration_id = str(data.get("registration_id") or "").strip()
+        email = str(data.get("email") or "").strip()
+        now = self.now_text()
+        stored = dict(data)
+        stored["received_at"] = now
+        with self._connect() as conn:
+            row = None
+            try:
+                account_id = int(registration_id)
+            except (TypeError, ValueError):
+                account_id = 0
+            if account_id > 0:
+                row = conn.execute(
+                    "SELECT id, extra_json FROM registration_results WHERE id = ?",
+                    (account_id,),
+                ).fetchone()
+            if row is None and email:
+                row = conn.execute(
+                    """
+                    SELECT id, extra_json
+                    FROM registration_results
+                    WHERE email = ? COLLATE NOCASE
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (email,),
+                ).fetchone()
+            if row is None:
+                return None
+            try:
+                extra = json.loads(str(row["extra_json"] or "{}"))
+                if not isinstance(extra, dict):
+                    extra = {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                extra = {}
+            extra["grokiq_result"] = stored
+            assignments = ["extra_json = :extra_json"]
+            values = {
+                "extra_json": json.dumps(extra, ensure_ascii=False, sort_keys=True),
+                "id": int(row["id"]),
+            }
+            if bool(stored.get("degraded")):
+                assignments.append("bot_risk = 1")
+            conn.execute(
+                f"UPDATE registration_results SET {', '.join(assignments)} WHERE id = :id",
+                values,
+            )
+            refreshed = conn.execute(
+                "SELECT * FROM registration_results WHERE id = ?",
+                (int(row["id"]),),
+            ).fetchone()
+            return dict(refreshed) if refreshed is not None else {"id": int(row["id"])}
+
+
+    @staticmethod
+    def _normalize_exit_ip(value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        try:
+            return ipaddress.ip_address(text).compressed
+        except ValueError:
+            return ""
+
+    def remember_flagged_exit_ip(
+        self,
+        ip: str,
+        *,
+        email: str = "",
+        bot_flag_source: Any = None,
+        failure_reason: str = "",
+    ) -> bool:
+        """记录一次注册风控对应的浏览器出口 IP。"""
+        normalized = self._normalize_exit_ip(ip)
+        if not normalized:
+            return False
+        now = self.now_text()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO flagged_exit_ips (
+                    ip, first_seen_at, last_seen_at, hit_count,
+                    last_email, last_bot_flag_source, last_failure_reason
+                )
+                VALUES (?, ?, ?, 1, ?, ?, ?)
+                ON CONFLICT(ip) DO UPDATE SET
+                    last_seen_at = excluded.last_seen_at,
+                    hit_count = hit_count + 1,
+                    last_email = CASE
+                        WHEN excluded.last_email = '' THEN last_email
+                        ELSE excluded.last_email
+                    END,
+                    last_bot_flag_source = CASE
+                        WHEN excluded.last_bot_flag_source = '' THEN last_bot_flag_source
+                        ELSE excluded.last_bot_flag_source
+                    END,
+                    last_failure_reason = CASE
+                        WHEN excluded.last_failure_reason = '' THEN last_failure_reason
+                        ELSE excluded.last_failure_reason
+                    END
+                """,
+                (
+                    normalized,
+                    now,
+                    now,
+                    str(email or "").strip(),
+                    "" if bot_flag_source is None else str(bot_flag_source),
+                    str(failure_reason or "").strip(),
+                ),
+            )
+        return True
+
+    def is_flagged_exit_ip(self, ip: str) -> bool:
+        normalized = self._normalize_exit_ip(ip)
+        if not normalized:
+            return False
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM flagged_exit_ips WHERE ip = ?",
+                (normalized,),
+            ).fetchone()
+        return row is not None
+
+    def list_flagged_exit_ips(self, limit: int = 200) -> List[Dict[str, Any]]:
+        try:
+            capped = max(1, min(int(limit or 200), 1000))
+        except (TypeError, ValueError):
+            capped = 200
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT ip, first_seen_at, last_seen_at, hit_count,
+                       last_email, last_bot_flag_source, last_failure_reason
+                FROM flagged_exit_ips
+                ORDER BY last_seen_at DESC, ip
+                LIMIT ?
+                """,
+                (capped,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def delete_flagged_exit_ip(self, ip: str) -> bool:
+        normalized = self._normalize_exit_ip(ip)
+        if not normalized:
+            return False
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM flagged_exit_ips WHERE ip = ?",
+                (normalized,),
+            )
+        return bool(cursor.rowcount)
+
     def update_bot_risk_by_email(
         self,
         email: str,
@@ -1050,6 +1235,21 @@ class RegistrationRepository:
                 """
             )
             return int(bot_risk_cursor.rowcount or 0) + int(relogin_cursor.rowcount or 0)
+
+    def backfill_grokiq_degraded_bot_risk(self) -> int:
+        """GrokIQ 降智回传视为原来的风控标记。"""
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE registration_results
+                SET bot_risk = 1
+                WHERE COALESCE(bot_risk, 0) = 0
+                  AND json_valid(extra_json)
+                  AND json_extract(extra_json, '$.grokiq_result.degraded')
+                      IN (1, '1', 'true', 'True')
+                """
+            )
+            return int(cursor.rowcount or 0)
 
     def update_remote_import_status(
         self,

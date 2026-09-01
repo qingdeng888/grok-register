@@ -1,12 +1,12 @@
 import {
   Archive,
   FileJson2,
-  KeyRound,
   LayoutDashboard,
   Mail,
   MonitorDot,
   PlaySquare,
   RefreshCcw,
+  ShieldAlert,
   ShieldCheck,
   Settings2,
   SlidersHorizontal,
@@ -29,6 +29,7 @@ export type NavigationGroup = {
 export const accountNavigationItems: readonly NavigationItem[] = [
   { to: "/accounts", label: "账号管理", shortLabel: "账号", icon: Users },
   { to: "/accounts/sso-check", label: "SSO 风控检查", shortLabel: "风控", icon: ShieldCheck },
+  { to: "/accounts/exit-ips", label: "出口 IP 风控", shortLabel: "出口IP", icon: ShieldAlert },
   { to: "/accounts/relogin", label: "账号重新登录", shortLabel: "重登", icon: RefreshCcw },
   { to: "/accounts/credentials", label: "授权文件管理", shortLabel: "授权", icon: Archive },
 ];
@@ -53,7 +54,6 @@ export const navigationGroups: readonly NavigationGroup[] = [
     label: "系统配置",
     items: [
       { to: "/settings/registration", label: "注册设置", shortLabel: "设置", icon: SlidersHorizontal },
-      { to: "/settings/tokenauth", label: "TokenAuth", shortLabel: "TokenAuth", icon: KeyRound },
       { to: "/settings/mail", label: "邮箱服务", shortLabel: "邮箱", icon: Mail },
       { to: "/settings/outlook", label: "Outlook 邮箱池", shortLabel: "Outlook", icon: Settings2 },
       { to: "/settings/config", label: "配置文件", shortLabel: "配置", icon: FileJson2 },

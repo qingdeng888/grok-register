@@ -94,7 +94,33 @@ export type AccountRecord = {
     delivered_at: string;
     last_error: string;
   };
+  grokiq_result?: {
+    event_id?: string;
+    event_type?: string;
+    verdict?: string;
+    degraded?: boolean;
+    monitor_status?: string;
+    risk_score?: number;
+    risk_reasons?: string[];
+    isolated?: boolean;
+    probe_outcome?: string;
+    occurred_at?: string;
+    received_at?: string;
+    source?: string;
+  } | null;
   extra?: Record<string, unknown>;
+  exit_ip?: string;
+  exit_ip_at_start?: string;
+};
+
+export type FlaggedExitIp = {
+  ip: string;
+  first_seen_at: string;
+  last_seen_at: string;
+  hit_count: number;
+  last_email: string;
+  last_bot_flag_source: string;
+  last_failure_reason: string;
 };
 
 export type Stats = {
@@ -227,6 +253,13 @@ export type AuthArchiveDownload = {
 };
 
 export type AuthKind = "cpa" | "grok2api" | "sso";
+
+export type OutlookEmailGroup = {
+  id: number;
+  name: string;
+  account_count: number;
+  is_system: boolean;
+};
 
 export type ConfigFileSnapshot = {
   path: string;
@@ -429,6 +462,15 @@ export const api = {
       "/api/accounts/delete",
       { method: "POST", body: JSON.stringify({ ids, delete_files: deleteFiles }) }
     ),
+  flaggedExitIps: () =>
+    request<{ ok: boolean; items: FlaggedExitIp[]; total: number }>("/api/flagged-exit-ips"),
+  deleteFlaggedExitIp: (ip: string) =>
+    request<{ ok: boolean; deleted: string }>("/api/flagged-exit-ips/delete", {
+      method: "POST",
+      body: JSON.stringify({ ip }),
+    }),
+  outlookemailGroups: () =>
+    request<{ ok: boolean; groups: OutlookEmailGroup[] }>("/api/outlookemail/groups"),
   getConfig: () => request<{ ok: boolean; config: Record<string, any> }>("/api/config"),
   getConfigFile: () => request<{ ok: boolean; file: ConfigFileSnapshot }>("/api/config/file"),
   saveConfig: (config: Record<string, any>) =>
